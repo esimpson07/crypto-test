@@ -1,0 +1,46 @@
+[package]
+name = "blockchain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# SHA-256 hashing — used for block hashing, mining, and address derivation.
+# Remains secure against quantum computers (Grover's algorithm only halves
+# its effective security level, which is still sufficient).
+sha2 = "0.10"
+
+# Hex encoding/decoding — converts raw bytes to readable strings and back.
+# Used throughout for displaying hashes, addresses, and keys.
+hex = "0.4"
+
+# Timestamps — provides the current UTC time for block creation.
+chrono = "0.4"
+
+# Serialization — converts Rust structs to/from JSON for saving to disk
+# and transmitting over the network. The "derive" feature auto-generates
+# Serialize/Deserialize implementations for our structs.
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Post-quantum cryptography — replaces the classical secp256k1 ECDSA scheme.
+# CRYSTALS-Dilithium3 is a lattice-based signature algorithm standardized
+# by NIST in 2024 (FIPS 204). It is resistant to both classical and
+# quantum computer attacks including Shor's Algorithm.
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits    = "0.3"
+
+# Wallet encryption — AES-256-GCM encrypts private keys before saving to disk.
+# AES-256-GCM is not broken by quantum computers and remains fully secure.
+aes-gcm = "0.10"
+
+# PBKDF2 key derivation — turns the user's password into an AES encryption key.
+# 100,000 iterations make brute-force attacks computationally expensive.
+pbkdf2 = "0.12"
+
+# Cryptographically secure random number generation.
+# Used for generating key pairs and encryption salts/nonces.
+rand = "0.8"
+
+# Async runtime — powers the P2P networking layer.
+# "full" enables all Tokio features including TCP networking and async tasks.
+tokio = { version = "1", features = ["full"] }
