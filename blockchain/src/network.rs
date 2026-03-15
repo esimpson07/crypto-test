@@ -394,3 +394,185 @@ pub async fn start_node(
         }
     }
 }
+
+/// Registers with the seed node and returns the list of known peers.
+pub async fn register_with_seed(
+    seed_addr: &str,
+    our_listen_addr: &str,
+) -> Vec<String> {
+    let mut stream = match TcpStream::connect(seed_addr).await {
+        Ok(s)  => s,
+        Err(e) => {
+            println!("[seed] Could not reach seed node {}: {}", seed_addr, e);
+            return vec![];
+        }
+    };
+
+    // Send Announce message
+    let msg  = serde_json::json!({ "Announce": { "address": our_listen_addr } });
+    let json = msg.to_string();
+    let len  = json.len() as u32;
+    if stream.write_all(&len.to_be_bytes()).await.is_err() { return vec![]; }
+    if stream.write_all(json.as_bytes()).await.is_err()    { return vec![]; }
+
+    // Read length-prefixed response
+    let mut len_bytes = [0u8; 4];
+    if stream.read_exact(&mut len_bytes).await.is_err() { return vec![]; }
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    let mut buf = vec![0u8; len];
+    if stream.read_exact(&mut buf).await.is_err() { return vec![]; }
+
+    let response = String::from_utf8(buf).unwrap_or_default();
+
+    // Parse peer list out of PeerList response
+    match serde_json::from_str::<serde_json::Value>(&response) {
+        Ok(val) => {
+            if let Some(peers) = val["PeerList"]["peers"].as_array() {
+                let list: Vec<String> = peers
+                    .iter()
+                    .filter_map(|p| p.as_str().map(String::from))
+                    .collect();
+                println!("[seed] Received {} peer(s) from seed node", list.len());
+                return list;
+            }
+        }
+        Err(e) => println!("[seed] Could not parse seed response: {}", e),
+    }
+    vec![]
+}
+
+/// Sends a heartbeat to the seed node every 5 minutes.
+/// Runs forever in a background task.
+pub async fn heartbeat_loop(seed_addr: String, our_listen_addr: String) {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        match TcpStream::connect(&seed_addr).await {
+            Ok(mut stream) => {
+                let msg  = serde_json::json!({
+                    "Heartbeat": { "address": our_listen_addr }
+                });
+                let json = msg.to_string();
+                let len  = json.len() as u32;
+                let _    = stream.write_all(&len.to_be_bytes()).await;
+                let _    = stream.write_all(json.as_bytes()).await;
+                println!("[seed] Heartbeat sent to seed node");
+            }
+            Err(e) => println!("[seed] Heartbeat failed: {}", e),
+        }
+    }
+}
+
+/// Public wrapper around handle_peer so it can be called from main.rs
+pub async fn handle_peer_public(
+    stream: TcpStream,
+    chain: Arc<Mutex<Blockchain>>,
+    peer_addr: String,
+    chain_path: String,
+) {
+    handle_peer(stream, chain, peer_addr, chain_path).await;
+}
+
+/// Detects this machine's public IP by making a raw HTTP request
+/// using only Tokio's TCP stream — no extra dependencies needed.
+///
+/// Connects directly to api.ipify.org and sends a minimal HTTP GET request,
+/// then parses the plain text IP address from the response.
+pub async fn get_public_ip() -> String {
+    // We'll try a few services in case one is down
+    // Each entry is (host, port, http_request)
+    let services = [
+        (
+            "api.ipify.org",
+            80u16,
+            "GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "ifconfig.me",
+            80u16,
+            "GET /ip HTTP/1.0\r\nHost: ifconfig.me\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "icanhazip.com",
+            80u16,
+            "GET / HTTP/1.0\r\nHost: icanhazip.com\r\nConnection: close\r\n\r\n",
+        ),
+    ];
+
+    for (host, port, request) in &services {
+        // Resolve hostname to IP and connect
+        let addr = format!("{}:{}", host, port);
+
+        match TcpStream::connect(&addr).await {
+            Ok(mut stream) => {
+                // Send the raw HTTP request
+                if stream.write_all(request.as_bytes()).await.is_err() {
+                    continue;
+                }
+
+                // Read the response
+                let mut response = Vec::new();
+                let mut buf = [0u8; 1024];
+
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0)    => break, // connection closed
+                        Ok(n)    => response.extend_from_slice(&buf[..n]),
+                        Err(_)   => break,
+                    }
+                    // Stop reading once we have enough data
+                    if response.len() > 4096 { break; }
+                }
+
+                let response_str = String::from_utf8_lossy(&response);
+
+                // HTTP response looks like:
+                // HTTP/1.0 200 OK\r\n
+                // Content-Type: text/plain\r\n
+                // \r\n
+                // 76.32.11.4
+                //
+                // We want the last non-empty line which is the IP address
+                if let Some(ip) = response_str
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .last()
+                {
+                    // Validate it looks like an IP address
+                    // IPv4 addresses contain dots and are short
+                    let ip = ip.to_string();
+                    if ip.contains('.')
+                        && ip.len() >= 7
+                        && ip.len() <= 15
+                        && ip.chars().all(|c| c.is_numeric() || c == '.')
+                    {
+                        println!("[network] Detected public IP: {}", ip);
+                        return ip;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("[network] Could not connect to {}: {}", host, e);
+                continue;
+            }
+        }
+    }
+
+    // All services failed — fall back to local IP detection
+    println!("[network] Public IP detection failed — falling back to local IP");
+    get_local_ip().await
+}
+
+/// Falls back to detecting the local network IP if public IP detection fails.
+/// Useful for same-WiFi testing without internet access.
+async fn get_local_ip() -> String {
+    let targets = ["8.8.8.8:53", "1.1.1.1:53"];
+    for target in &targets {
+        if let Ok(stream) = TcpStream::connect(target).await {
+            if let Ok(addr) = stream.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}

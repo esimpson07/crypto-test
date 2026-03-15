@@ -165,12 +165,14 @@ async fn main() {
                 return;
             }
 
-            // Generate a new Dilithium3 key pair
+            // In new-wallet command, after generating the wallet:
             let wallet = crypto::Wallet::new();
 
-            // Concatenate private key (8,000 hex chars) + public key (3,904 hex chars)
-            // into one string. wallet_store.rs encrypts the whole thing with AES-256-GCM.
-            // On load, from_hex() splits at the 8,000 char boundary to recover both keys.
+            println!("Key sizes — private: {} bytes, public: {} bytes",
+                wallet.private_key.len(),
+                wallet.public_key.len()
+            );
+
             let combined_key_hex = format!(
                 "{}{}",
                 hex::encode(&wallet.private_key),
@@ -344,14 +346,20 @@ async fn main() {
         // =====================================================================
         "node" => {
             let port: u16 = args.get(2)
-                .expect("Usage: node <port> [peer_ip:port]")
+                .expect("Usage: node <port> [peer_ip:port] [--seed <ip:port>]")
                 .parse()
-                .expect("Port must be a number between 1 and 65535");
+                .expect("Port must be a number");
 
-            // argv[3] may be a peer address or a --flag — only use it as a peer
-            // address if it doesn't start with "--"
+            // Direct peer connection (optional — used for local testing)
             let connect_to = args.get(3)
                 .filter(|a| !a.starts_with("--"))
+                .cloned();
+
+            // Seed node address (optional — used for internet connections)
+            // Usage: --seed YOUR_SEED_IP:8000
+            let seed_addr = args.iter()
+                .position(|a| a == "--seed")
+                .and_then(|i| args.get(i + 1))
                 .cloned();
 
             let password     = ask_password("Password: ");
@@ -362,14 +370,58 @@ async fn main() {
             println!("Wallet:  {} ({}...)", wallet_file, &wallet.address()[..16]);
             println!("Chain:   {}", chain_file);
 
-            // Load the chain and wrap it in Arc<Mutex<>> so it can be safely
-            // shared across all the concurrent peer handler tasks
             let chain = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
             let chain = Arc::new(Mutex::new(chain));
 
+            // If --seed was provided, register with the seed node and
+            // connect to any peers it returns
+            if let Some(ref seed) = seed_addr {
+                // This is the address OTHER nodes use to reach YOU
+                // Replace YOUR_PUBLIC_IP with your actual public IP from whatismyip.com
+                // If testing on same WiFi, use your local 192.168.x.x IP instead
+                let our_ip   = network::get_public_ip().await;
+                let our_addr = format!("{}:{}", our_ip, port);
+
+                println!("Registering with seed node {}...", seed);
+                println!("Our listen address: {}", our_addr);
+
+                // Register with seed and get list of existing peers
+                let peer_list = network::register_with_seed(seed, &our_addr).await;
+
+                // Start sending heartbeats every 5 minutes so seed keeps us registered
+                let seed_clone = seed.clone();
+                let addr_clone = our_addr.clone();
+                tokio::spawn(async move {
+                    network::heartbeat_loop(seed_clone, addr_clone).await;
+                });
+
+                // Connect directly to each peer the seed gave us
+                for peer_addr in peer_list {
+                    let chain_clone = Arc::clone(&chain);
+                    let path_clone  = chain_file.clone();
+                    tokio::spawn(async move {
+                        match TcpStream::connect(&peer_addr).await {
+                            Ok(mut stream) => {
+                                println!("[seed] Connecting to peer: {}", peer_addr);
+                                let _ = network::send_message(
+                                    &mut stream,
+                                    &network::Message::RequestChain
+                                ).await;
+                                network::handle_peer_public(
+                                    stream,
+                                    chain_clone,
+                                    peer_addr,
+                                    path_clone
+                                ).await;
+                            }
+                            Err(e) => println!("[seed] Could not reach peer {}: {}", peer_addr, e),
+                        }
+                    });
+                }
+            }
+
             println!("Starting node on port {}...", port);
-            // This call never returns — it runs the node until the process is killed
             start_node(port, connect_to, chain, chain_file.clone()).await;
         }
 

@@ -151,9 +151,14 @@ impl Wallet {
     /// The combined hex string is what wallet_store.rs encrypts and saves.
     /// This function splits them back apart when loading.
     pub fn from_hex(combined_hex: &str) -> Self {
-        // Split at the known boundary: private key is exactly 8,000 hex chars
-        let sk_hex = &combined_hex[..8000];
-        let pk_hex = &combined_hex[8000..];
+        // Ask the crate for the actual secret key size in bytes, then convert to hex chars
+        // We can't hardcode this — the actual size varies by crate version
+        let sk_size_bytes = dilithium3::secret_key_bytes();
+        let sk_hex_len    = sk_size_bytes * 2; // each byte = 2 hex chars
+
+        // Split the combined hex string at the correct boundary
+        let sk_hex = &combined_hex[..sk_hex_len];
+        let pk_hex = &combined_hex[sk_hex_len..];
 
         Wallet {
             private_key: hex::decode(sk_hex).expect("Invalid private key hex"),
