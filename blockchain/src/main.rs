@@ -2,39 +2,48 @@
 // main.rs — Command Line Interface
 // =============================================================================
 //
-// This is the program's entry point. It reads the command the user typed,
-// resolves which wallet and chain files to use, and routes execution to the
-// appropriate logic across the other modules.
+// Entry point for the program. Reads the user's command, resolves which wallet
+// and chain files to use, and routes to the appropriate handler.
 //
-// AVAILABLE COMMANDS:
-//   new-wallet              create a new post-quantum wallet, encrypted with a password
-//   list-wallets            show all .dat wallet files in the current directory
-//   balance                 display your address and current coin balance
-//   mine                    mine a new block locally (earn block reward)
-//   mine-and-broadcast      mine a block and broadcast it to a peer node
-//   send <to> <amount>      sign and submit a transaction to another address
-//   chain                   print every block and its transactions
-//   node <port> [peer]      start a persistent P2P node (runs until Ctrl+C)
+// COMMANDS:
+//
+//   new-wallet              Generate a new post-quantum wallet, encrypted with a password
+//   list-wallets            Show all .dat wallet files in the current directory
+//   balance                 Show your address and current coin balance
+//   mine                    Mine a block locally and earn the block reward
+//   mine-and-broadcast      Mine a block and immediately broadcast it to a peer
+//   send <to> <amount>      Sign a transaction and submit it to the mempool
+//   chain                   Print every block and its transactions
+//   node <port> [peer]      Start a persistent P2P node (runs until Ctrl+C)
 //
 // GLOBAL OPTIONS (append to any command):
-//   --wallet <n>     use wallet file <n>.dat  (default: wallet.dat)
-//   --network <n>    use chain file <n>_chain.json  (default: chain.json)
+//
+//   --wallet <n>    use wallet file <n>.dat          (default: wallet.dat)
+//   --network <n>   use chain file <n>_chain.json    (default: chain.json)
+//   --seed <ip:port> register with a seed node for peer discovery
 //
 // EXAMPLES:
+//
 //   cargo run -- new-wallet --wallet alice
 //   cargo run -- balance --wallet alice
 //   cargo run -- mine --wallet alice --network mainnet
-//   cargo run -- node 8000 --wallet alice --network mainnet
-//   cargo run -- node 8001 192.168.1.5:8000 --wallet bob --network mainnet
-//   cargo run -- mine-and-broadcast 192.168.1.5:8000 --wallet alice
 //   cargo run -- send <address> 10 --wallet alice
 //   cargo run -- send <address> 10 192.168.1.5:8000 --wallet alice
+//   cargo run -- node 8001 --wallet alice --network mainnet
+//   cargo run -- node 8001 --seed 136.111.45.6:8000 --wallet alice
+//   cargo run -- node 8001 192.168.1.5:8000 --wallet alice
+//   cargo run -- mine-and-broadcast 192.168.1.5:8000 --wallet alice
 //
 // POST-QUANTUM NOTES:
+//
 //   Wallet addresses are SHA-256(public_key) — a compact 64-char hex string.
-//   When sending, Transaction.from is set to the FULL public key (3,904 chars)
-//   because Dilithium3 signature verification requires the actual key bytes,
-//   not just the address hash. Recipients always share their compact address.
+//   Transaction.from stores the FULL public key (3,904 chars) because
+//   Dilithium3 signature verification requires the actual key bytes, not
+//   just the address hash. Recipients always share their compact address.
+//
+//   The combined private+public key hex is what wallet_store.rs encrypts.
+//   Wallet.from_hex() splits them using the crate's reported key size —
+//   NOT a hardcoded constant — to handle version differences correctly.
 // =============================================================================
 
 #![allow(unused_imports, dead_code)]
@@ -56,32 +65,21 @@ use tokio::net::TcpStream;
 use std::io::{self, Write};
 
 // =============================================================================
-// Input Helpers
+// Helpers
 // =============================================================================
 
-/// Prints a prompt and reads one line of input from stdin.
-///
-/// Used for all password prompts and any other interactive input.
-/// Input is visible as the user types (no hidden password mode).
-/// Trims the trailing newline before returning.
+/// Prints a prompt and reads one line from stdin.
+/// Input is visible as the user types. Trailing newline is trimmed.
 fn ask_password(prompt: &str) -> String {
     print!("{}", prompt);
-    // Flush stdout so the prompt appears immediately before the user types
     io::stdout().flush().unwrap();
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     input.trim().to_string()
 }
 
-// =============================================================================
-// Argument Parsing Helpers
-// =============================================================================
-
-/// Resolves the wallet filename from the command line arguments.
-///
-/// Scans all args for "--wallet <n>" and returns "<n>.dat".
-/// Defaults to "wallet.dat" if the flag isn't present.
-/// The flag can appear anywhere in the argument list.
+/// Finds "--wallet <n>" in args and returns "<n>.dat".
+/// Defaults to "wallet.dat" if the flag is absent.
 fn get_wallet_file(args: &[String]) -> String {
     for i in 0..args.len() {
         if args[i] == "--wallet" {
@@ -93,13 +91,9 @@ fn get_wallet_file(args: &[String]) -> String {
     "wallet.dat".to_string()
 }
 
-/// Resolves the chain filename from the command line arguments.
-///
-/// Scans all args for "--network <n>" and returns "<n>_chain.json".
-/// Defaults to "chain.json" if the flag isn't present.
-///
-/// Using different --network values lets you run completely separate
-/// blockchains on the same machine:
+/// Finds "--network <n>" in args and returns "<n>_chain.json".
+/// Defaults to "chain.json" if the flag is absent.
+/// Lets you run separate blockchains on the same machine:
 ///   --network mainnet  →  mainnet_chain.json
 ///   --network testnet  →  testnet_chain.json
 fn get_chain_file(args: &[String]) -> String {
@@ -113,32 +107,28 @@ fn get_chain_file(args: &[String]) -> String {
     "chain.json".to_string()
 }
 
-/// Returns the wallet's full Dilithium3 public key as a hex string.
+/// Returns the wallet's full Dilithium3 public key as hex.
 ///
-/// This is used as Transaction.from — NOT the same as wallet.address().
-///   wallet.address()   = SHA-256(public_key)  ← compact, 64 chars, for display
-///   public_key_hex()   = hex(public_key)       ← full key, 3904 chars, for transactions
+/// This is used as Transaction.from — distinct from wallet.address():
+///   wallet.address()  =  SHA-256(public_key)  64 chars, for display/receiving
+///   public_key_hex()  =  hex(public_key)       3,904 chars, stored in transactions
 ///
-/// The full public key must be in transactions because Dilithium3 signature
-/// verification requires the actual key bytes — it cannot recover them from
-/// the signature the way classical ECDSA can.
+/// The full key is required in transactions because Dilithium3 verification
+/// needs the actual key bytes — it cannot recover them from a signature
+/// the way classical ECDSA can.
 fn public_key_hex(wallet: &crypto::Wallet) -> String {
     hex::encode(&wallet.public_key)
 }
 
 // =============================================================================
-// Main Entry Point
+// Entry Point
 // =============================================================================
 
-/// The async main function — required by Tokio for the networking layer.
-///
-/// Reads argv[1] as the command name, resolves wallet/chain file paths from
-/// flags, then dispatches to the appropriate command handler.
+/// Async main — the #[tokio::main] macro is required for the networking layer.
+/// Dispatches to the appropriate command handler based on argv[1].
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-
-    // argv[0] = program name, argv[1] = command, argv[2+] = arguments/flags
     let command     = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     let wallet_file = get_wallet_file(&args);
     let chain_file  = get_chain_file(&args);
@@ -146,12 +136,11 @@ async fn main() {
     match command {
 
         // =====================================================================
-        // new-wallet — Generate a fresh post-quantum wallet and save it encrypted
+        // new-wallet
+        // Generate a Dilithium3 key pair, encrypt with password, save to disk.
         // =====================================================================
         "new-wallet" => {
-            // Safety check: refuse to overwrite an existing wallet.
-            // Overwriting would permanently destroy the coins at that address
-            // since the old private key would be gone with no recovery option.
+            // Refuse to overwrite — losing a private key means losing coins forever
             if std::path::Path::new(wallet_file.as_str()).exists() {
                 println!("Wallet '{}' already exists!", wallet_file);
                 println!("Use a different name: cargo run -- new-wallet --wallet <n>");
@@ -165,14 +154,14 @@ async fn main() {
                 return;
             }
 
-            // In new-wallet command, after generating the wallet:
             let wallet = crypto::Wallet::new();
 
+            // Show actual key sizes so the user knows what their crate version uses
             println!("Key sizes — private: {} bytes, public: {} bytes",
-                wallet.private_key.len(),
-                wallet.public_key.len()
-            );
+                wallet.private_key.len(), wallet.public_key.len());
 
+            // Concatenate private key + public key as one hex string for encryption.
+            // from_hex() splits them on load using the crate's reported key size.
             let combined_key_hex = format!(
                 "{}{}",
                 hex::encode(&wallet.private_key),
@@ -183,14 +172,13 @@ async fn main() {
                 .expect("Failed to save wallet");
 
             println!("Wallet created: {}", wallet_file);
-            // Show the compact address (SHA-256 of public key) — this is what
-            // others need to send you coins. Don't confuse this with the full public key.
-            println!("Your address:   {}", wallet.address());
+            println!("Your address:   {}", wallet.address()); // SHA-256(public_key)
             println!("KEEP YOUR PASSWORD SAFE — it cannot be recovered if lost");
         }
 
         // =====================================================================
-        // list-wallets — Show all wallet files in the current directory
+        // list-wallets
+        // Show all .dat files in the current directory.
         // =====================================================================
         "list-wallets" => {
             let entries = std::fs::read_dir(".").unwrap();
@@ -206,38 +194,37 @@ async fn main() {
         }
 
         // =====================================================================
-        // balance — Show address and current coin balance
+        // balance
+        // Show this wallet's address and current coin balance.
         // =====================================================================
         "balance" => {
-            let password        = ask_password("Password: ");
-            let combined_key    = wallet_store::load_wallet(&password, wallet_file.as_str())
+            let password     = ask_password("Password: ");
+            let combined_key = wallet_store::load_wallet(&password, wallet_file.as_str())
                 .expect("Failed to load wallet");
-            let wallet          = crypto::Wallet::from_hex(&combined_key);
-            let chain           = chain_store::load_chain(chain_file.as_str())
+            let wallet = crypto::Wallet::from_hex(&combined_key);
+            let chain  = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
 
-            // wallet.address() = SHA-256(public_key) — compact and safe to share
             println!("Address: {}", wallet.address());
             println!("Balance: {} coins", chain.get_balance(&wallet.address()));
             println!("Supply:  {}/{} coins in circulation", chain.total_supply, MAX_SUPPLY);
         }
 
         // =====================================================================
-        // mine — Mine a new block locally, earning the current block reward
+        // mine
+        // Run proof-of-work locally. Block reward and confirmed mempool
+        // transactions go to this wallet's address.
         // =====================================================================
         "mine" => {
-            let password        = ask_password("Password: ");
-            let combined_key    = wallet_store::load_wallet(&password, wallet_file.as_str())
+            let password     = ask_password("Password: ");
+            let combined_key = wallet_store::load_wallet(&password, wallet_file.as_str())
                 .expect("Failed to load wallet");
-            let wallet          = crypto::Wallet::from_hex(&combined_key);
-            let mut chain       = chain_store::load_chain(chain_file.as_str())
+            let wallet    = crypto::Wallet::from_hex(&combined_key);
+            let mut chain = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
 
-            // Mine a block — proof-of-work happens here (may take a while)
-            // The block reward and any mempool transactions go to wallet.address()
-            chain.mine_block(wallet.address());
+            chain.mine_block(wallet.address()); // blocks until a valid nonce is found
 
-            // Persist the updated chain and clear the now-confirmed mempool file
             chain_store::save_chain(&chain, chain_file.as_str())
                 .expect("Failed to save chain");
             chain_store::clear_mempool(chain_file.as_str());
@@ -246,54 +233,45 @@ async fn main() {
         }
 
         // =====================================================================
-        // send — Sign a transaction and submit it to the mempool
+        // send <recipient_address> <amount> [peer_ip:port]
         //
-        // Usage: send <recipient_address> <amount> [peer_ip:port]
+        // Signs a transaction and adds it to the local mempool.
+        // Optionally broadcasts it to a peer node immediately.
         //
-        // KEY DETAIL — Transaction.from vs wallet.address():
-        //   `from` = full public key hex (3,904 chars) — needed for Dilithium verification
-        //   `to`   = recipient's compact address (64 chars) — what they share from `balance`
+        // Transaction.from  = FULL public key hex (needed for Dilithium verification)
+        // Transaction.to    = recipient's compact address (from their `balance` command)
         //
-        // The transaction sits in the mempool until someone runs `mine` or
-        // `mine-and-broadcast` to confirm it in a block.
+        // The transaction stays pending until someone mines a block.
         // =====================================================================
         "send" => {
             let to_address = args.get(2).expect("Usage: send <address> <amount> [peer]");
             let amount: u64 = args.get(3)
                 .expect("Usage: send <address> <amount> [peer]")
                 .parse()
-                .expect("Amount must be a whole number (no decimals)");
+                .expect("Amount must be a whole number");
 
             let password     = ask_password("Password: ");
             let combined_key = wallet_store::load_wallet(&password, wallet_file.as_str())
                 .expect("Failed to load wallet");
-            let wallet       = crypto::Wallet::from_hex(&combined_key);
-            let mut chain    = chain_store::load_chain(chain_file.as_str())
+            let wallet    = crypto::Wallet::from_hex(&combined_key);
+            let mut chain = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
 
-            // Build the transaction:
-            //   from = FULL public key (for Dilithium verification, not the short address)
-            //   to   = recipient's compact address (what they gave you from `balance`)
-            let from   = public_key_hex(&wallet);
+            let from   = public_key_hex(&wallet); // full public key, not address
             let mut tx = Transaction::new(from, to_address.clone(), amount);
-
-            // Sign with our Dilithium3 private key — proves we authorized this transfer
             tx.sign(&wallet);
 
             match chain.add_transaction(tx.clone()) {
                 Ok(_) => {
-                    // Save the updated mempool to disk (persists across restarts)
                     chain_store::save_chain(&chain, chain_file.as_str())
                         .expect("Failed to save");
                     println!("Transaction added to mempool — mine a block to confirm it");
 
-                    // Optionally broadcast to a peer node immediately
-                    // argv[4] is the peer address, but only if it's not a -- flag
+                    // If a peer address was provided as argv[4], broadcast to them
                     if let Some(peer) = args.get(4).filter(|a| !a.starts_with("--")) {
                         match TcpStream::connect(peer).await {
                             Ok(mut stream) => {
-                                let msg = Message::NewTransaction(tx);
-                                match send_message(&mut stream, &msg).await {
+                                match send_message(&mut stream, &Message::NewTransaction(tx)).await {
                                     Ok(_)  => println!("Transaction broadcast to {}", peer),
                                     Err(e) => println!("Broadcast failed: {}", e),
                                 }
@@ -307,7 +285,8 @@ async fn main() {
         }
 
         // =====================================================================
-        // chain — Print every block and its transactions
+        // chain
+        // Print every block and its transactions. Validates the full chain.
         // =====================================================================
         "chain" => {
             let chain = chain_store::load_chain(chain_file.as_str())
@@ -319,44 +298,44 @@ async fn main() {
             for block in &chain.chain {
                 println!("\nBlock #{} | Hash: {}...", block.index, &block.hash[..16]);
                 for tx in &block.transactions {
-                    // sender_address() hashes tx.from (the full public key) to get
-                    // the compact address — same as wallet.address() for that key
+                    // sender_address() hashes tx.from (full public key) → compact address
                     let from = tx.sender_address();
                     let from_display = if from == "coinbase" {
-                        "coinbase ".to_string() // padded to align with 8-char addresses
+                        "coinbase ".to_string()
                     } else {
                         format!("{}...", &from[..8])
                     };
                     println!("  {} → {}... : {} coins",
-                        from_display,
-                        &tx.to[..8],
-                        tx.amount
-                    );
+                        from_display, &tx.to[..8], tx.amount);
                 }
             }
         }
 
         // =====================================================================
-        // node — Start a persistent P2P network node (runs until Ctrl+C)
+        // node <port> [direct_peer] [--seed <seed_ip:port>]
         //
-        // Usage: node <port> [peer_ip:port]
+        // Starts a persistent P2P node. Runs forever until Ctrl+C.
         //
-        // The node listens for incoming peer connections on <port>.
-        // If a peer address is provided, it also connects outward to sync chains.
+        // Direct peer (optional):  connects immediately on startup
+        //   cargo run -- node 8001 192.168.1.5:8000 --wallet alice
+        //
+        // Seed node (optional):    registers for peer discovery
+        //   cargo run -- node 8001 --seed 136.111.45.6:8000 --wallet alice
+        //
+        // Both can be combined, or neither used (just listens for incoming).
         // =====================================================================
         "node" => {
             let port: u16 = args.get(2)
-                .expect("Usage: node <port> [peer_ip:port] [--seed <ip:port>]")
+                .expect("Usage: node <port> [peer] [--seed <ip:port>]")
                 .parse()
                 .expect("Port must be a number");
 
-            // Direct peer connection (optional — used for local testing)
+            // argv[3] may be a direct peer address — skip if it's a flag
             let connect_to = args.get(3)
                 .filter(|a| !a.starts_with("--"))
                 .cloned();
 
-            // Seed node address (optional — used for internet connections)
-            // Usage: --seed YOUR_SEED_IP:8000
+            // --seed flag for seed node peer discovery
             let seed_addr = args.iter()
                 .position(|a| a == "--seed")
                 .and_then(|i| args.get(i + 1))
@@ -365,38 +344,35 @@ async fn main() {
             let password     = ask_password("Password: ");
             let combined_key = wallet_store::load_wallet(&password, wallet_file.as_str())
                 .expect("Failed to load wallet");
-            let wallet       = crypto::Wallet::from_hex(&combined_key);
+            let wallet = crypto::Wallet::from_hex(&combined_key);
 
-            println!("Wallet:  {} ({}...)", wallet_file, &wallet.address()[..16]);
-            println!("Chain:   {}", chain_file);
+            println!("Wallet: {} ({}...)", wallet_file, &wallet.address()[..16]);
+            println!("Chain:  {}", chain_file);
 
             let chain = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
             let chain = Arc::new(Mutex::new(chain));
 
-            // If --seed was provided, register with the seed node and
-            // connect to any peers it returns
+            // If --seed was given: register with seed node, connect to returned peers,
+            // and start sending heartbeats every 5 minutes to stay registered
             if let Some(ref seed) = seed_addr {
-                // This is the address OTHER nodes use to reach YOU
-                // Replace YOUR_PUBLIC_IP with your actual public IP from whatismyip.com
-                // If testing on same WiFi, use your local 192.168.x.x IP instead
+                // Auto-detect our public IP so we can tell the seed how to reach us
                 let our_ip   = network::get_public_ip().await;
                 let our_addr = format!("{}:{}", our_ip, port);
 
                 println!("Registering with seed node {}...", seed);
                 println!("Our listen address: {}", our_addr);
 
-                // Register with seed and get list of existing peers
                 let peer_list = network::register_with_seed(seed, &our_addr).await;
 
-                // Start sending heartbeats every 5 minutes so seed keeps us registered
+                // Start heartbeat loop in background (keeps our seed entry alive)
                 let seed_clone = seed.clone();
                 let addr_clone = our_addr.clone();
                 tokio::spawn(async move {
                     network::heartbeat_loop(seed_clone, addr_clone).await;
                 });
 
-                // Connect directly to each peer the seed gave us
+                // Connect directly to each peer the seed returned
                 for peer_addr in peer_list {
                     let chain_clone = Arc::clone(&chain);
                     let path_clone  = chain_file.clone();
@@ -409,10 +385,7 @@ async fn main() {
                                     &network::Message::RequestChain
                                 ).await;
                                 network::handle_peer_public(
-                                    stream,
-                                    chain_clone,
-                                    peer_addr,
-                                    path_clone
+                                    stream, chain_clone, peer_addr, path_clone
                                 ).await;
                             }
                             Err(e) => println!("[seed] Could not reach peer {}: {}", peer_addr, e),
@@ -422,16 +395,15 @@ async fn main() {
             }
 
             println!("Starting node on port {}...", port);
-            start_node(port, connect_to, chain, chain_file.clone()).await;
+            start_node(port, connect_to, chain, chain_file.clone()).await; // runs forever
         }
 
         // =====================================================================
-        // mine-and-broadcast — Mine a block and immediately send it to a peer
+        // mine-and-broadcast <peer_ip:port>
         //
-        // Usage: mine-and-broadcast <peer_ip:port>
-        //
-        // Use this when you want your mined block to reach the network right
-        // away without running a persistent node in the background.
+        // Mines a block locally then broadcasts it to a peer.
+        // Use this when you want to participate in the network without running
+        // a persistent node in the background.
         // =====================================================================
         "mine-and-broadcast" => {
             let peer = args.get(2)
@@ -440,24 +412,21 @@ async fn main() {
             let password     = ask_password("Password: ");
             let combined_key = wallet_store::load_wallet(&password, wallet_file.as_str())
                 .expect("Failed to load wallet");
-            let wallet       = crypto::Wallet::from_hex(&combined_key);
-            let mut chain    = chain_store::load_chain(chain_file.as_str())
+            let wallet    = crypto::Wallet::from_hex(&combined_key);
+            let mut chain = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
 
-            // Mine the block — proof-of-work computation happens here
             chain.mine_block(wallet.address());
 
-            // Save immediately so the block isn't lost if broadcast fails
+            // Save before broadcasting — block is preserved even if broadcast fails
             chain_store::save_chain(&chain, chain_file.as_str())
                 .expect("Failed to save");
             chain_store::clear_mempool(chain_file.as_str());
 
-            // Grab the block we just mined and broadcast it to the peer
             let latest_block = chain.latest_block().clone();
             match TcpStream::connect(peer).await {
                 Ok(mut stream) => {
-                    let msg = Message::NewBlock(latest_block);
-                    match send_message(&mut stream, &msg).await {
+                    match send_message(&mut stream, &Message::NewBlock(latest_block)).await {
                         Ok(_)  => println!("Block broadcast to {}", peer),
                         Err(e) => println!("Broadcast failed (block saved locally): {}", e),
                     }
@@ -469,7 +438,7 @@ async fn main() {
         }
 
         // =====================================================================
-        // help — Print usage information (shown for unknown commands too)
+        // help — shown for any unknown command
         // =====================================================================
         _ => {
             println!("Commands:");
@@ -478,23 +447,25 @@ async fn main() {
             println!("  balance                           show your address and coin balance");
             println!("  mine                              mine a block and earn rewards");
             println!("  mine-and-broadcast <peer>         mine a block and send to a peer");
-            println!("  send <to> <amount> [peer]         send coins to another address");
+            println!("  send <to> <amount> [peer]         send coins to an address");
             println!("  chain                             print all blocks and transactions");
             println!("  node <port> [peer]                start a persistent P2P node");
             println!();
             println!("Options (append to any command):");
-            println!("  --wallet <n>    use wallet file <n>.dat       (default: wallet.dat)");
-            println!("  --network <n>   use chain file <n>_chain.json (default: chain.json)");
+            println!("  --wallet <n>      wallet file to use       (default: wallet.dat)");
+            println!("  --network <n>     chain file to use        (default: chain.json)");
+            println!("  --seed <ip:port>  seed node for discovery  (use with node command)");
             println!();
             println!("Examples:");
             println!("  cargo run -- new-wallet --wallet alice");
             println!("  cargo run -- balance --wallet alice");
             println!("  cargo run -- mine --wallet alice --network mainnet");
-            println!("  cargo run -- node 8000 --wallet alice --network mainnet");
-            println!("  cargo run -- node 8001 192.168.1.5:8000 --wallet bob --network mainnet");
+            println!("  cargo run -- node 8001 --wallet alice --network mainnet");
+            println!("  cargo run -- node 8001 --seed 136.111.45.6:8000 --wallet alice");
+            println!("  cargo run -- node 8001 192.168.1.5:8000 --wallet alice");
             println!("  cargo run -- mine-and-broadcast 192.168.1.5:8000 --wallet alice");
-            println!("  cargo run -- send <recipient_address> 10 --wallet alice");
-            println!("  cargo run -- send <recipient_address> 10 192.168.1.5:8000 --wallet alice");
+            println!("  cargo run -- send <address> 10 --wallet alice");
+            println!("  cargo run -- send <address> 10 192.168.1.5:8000 --wallet alice");
         }
     }
 }

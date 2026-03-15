@@ -1,34 +1,38 @@
 // =============================================================================
-// blockchain.rs — The Blockchain and Consensus Rules
+// blockchain.rs — Chain State, Consensus Rules, and Supply Schedule
 // =============================================================================
 //
-// This is the heart of the system. The Blockchain struct ties everything together:
+// This is the heart of the system. The Blockchain struct manages:
 //
-//   chain        — the permanent, ordered record of every confirmed block
-//   mempool      — transactions waiting to be picked up by a miner
-//   utxo_set     — each address's current spendable balance
-//   total_supply — running total of all coins ever created
+//   chain         the permanent ordered record of every confirmed block
+//   mempool       transactions waiting to be picked up by a miner
+//   utxo_set      each address's current spendable balance
+//   total_supply  running count of all coins ever created
 //
-// THE UTXO SET EXPLAINED:
-//   UTXO stands for "Unspent Transaction Output." Real blockchains like Bitcoin
-//   don't store balances directly. Instead they track individual coin outputs
-//   that haven't been spent yet — your balance is the sum of all outputs
-//   pointing to your address that nobody has used as an input yet.
+// THE UTXO SET:
 //
-//   We simplify this to a HashMap<address, balance> which achieves the same
-//   effect: balances are always derived from the transaction history, never
-//   stored directly. If the file is lost or corrupted, we can always rebuild
-//   exact balances by replaying every transaction from genesis (chain_store.rs).
+//   UTXO stands for "Unspent Transaction Output." Instead of storing balances
+//   like a bank account, we track outputs from transactions that haven't been
+//   spent yet. Your balance is the sum of all outputs pointing to your address.
+//
+//   We simplify this to HashMap<address, balance> rather than tracking
+//   individual outputs. The simplification is safe because balances are
+//   never stored directly — they are always rebuilt from the transaction
+//   history when the chain loads. Corrupt or tampered balance data is
+//   automatically corrected on the next startup.
 //
 // SUPPLY SCHEDULE:
-//   Like Bitcoin, this blockchain has a fixed maximum supply and a halving
-//   schedule. The block reward starts at INITIAL_REWARD and halves every
-//   HALVING_INTERVAL blocks, eventually reaching zero. Once MAX_SUPPLY coins
-//   exist, no more are ever created — miners would earn only fees (not yet
-//   implemented) to continue securing the network.
 //
-// CUSTOMIZATION:
-//   Change the constants below to define your cryptocurrency's economics.
+//   Like Bitcoin, this chain has a fixed maximum supply and a halving
+//   schedule. The block reward starts at INITIAL_REWARD and halves every
+//   HALVING_INTERVAL blocks. Once MAX_SUPPLY coins exist, no more are
+//   created — miners would earn only transaction fees to keep running.
+//
+// TO CUSTOMIZE YOUR CRYPTOCURRENCY:
+//
+//   Edit the four constants directly below. After changing any constant,
+//   delete chain.json and any .mempool files before running — the old
+//   chain was built under different rules and will be inconsistent.
 // =============================================================================
 
 use std::collections::HashMap;
@@ -37,73 +41,66 @@ use crate::block::Block;
 use crate::transaction::Transaction;
 
 // =============================================================================
-// Economic Constants — Edit these to customize your cryptocurrency
+// Supply Constants
 // =============================================================================
 
-/// Number of leading zeros required in a block's SHA-256 hash.
-/// This is the proof-of-work difficulty. Each additional zero makes mining
-/// roughly 16x harder. Adjust to target your desired block time.
-///   3 = instant  |  4 = <1 second  |  5 = few seconds  |  6 = ~30 seconds
+/// Proof-of-work difficulty — how many leading zeros the block hash needs.
+/// Each additional zero makes mining roughly 16x harder.
+///   3 = instant  |  5 = few seconds  |  6 = ~30 seconds  |  7 = minutes
 pub const DIFFICULTY: usize = 5;
 
-/// Coins awarded to the miner of the first block.
-/// Halves every HALVING_INTERVAL blocks until it reaches zero.
+/// Coins awarded to the miner of each block, starting value.
+/// Halves every HALVING_INTERVAL blocks until it eventually reaches zero.
 pub const INITIAL_REWARD: u64 = 50;
 
-/// How many blocks between each reward halving.
-/// Bitcoin uses 210,000 (roughly 4 years). Use a smaller number for testing.
-/// Schedule: 50 → 25 → 12 → 6 → 3 → 1 → 0
+/// Blocks between each reward halving.
+/// Bitcoin uses 210,000 (~4 years). Smaller values are useful for testing.
+/// Reward schedule: 50 → 25 → 12 → 6 → 3 → 1 → 0
 pub const HALVING_INTERVAL: u64 = 10;
 
-/// The absolute hard cap on total coins that will ever exist.
+/// Hard cap — the maximum coins that will ever exist.
 /// Once total_supply reaches this, mining produces no further rewards.
-/// Miners can still mine blocks to confirm transactions (fee-only mining).
 pub const MAX_SUPPLY: u64 = 1_000;
 
 // =============================================================================
-// Blockchain Struct
+// Blockchain
 // =============================================================================
 
-/// The main blockchain — holds all state for one network instance.
+/// The complete blockchain state for one network instance.
 ///
-/// Serializable so the chain can be saved/loaded via chain_store.rs.
-/// Only `chain` and `mempool` are actually written to disk. The `utxo_set`
-/// and `total_supply` are derived fields rebuilt from the chain on load —
-/// this guarantees they're always consistent with the transaction history.
+/// Only `chain` and `mempool` are written to disk. The `utxo_set` and
+/// `total_supply` are derived fields always rebuilt from the chain on load,
+/// guaranteeing they stay consistent with the transaction history.
 #[derive(Serialize, Deserialize)]
 pub struct Blockchain {
-    /// The ordered, immutable record of all confirmed blocks.
-    /// Index 0 is always the hardcoded genesis block. New blocks are appended
-    /// to the end. Blocks are never removed or reordered once added.
+    /// All confirmed blocks in order, starting with the genesis block.
+    /// Blocks are appended and never removed or reordered.
     pub chain: Vec<Block>,
 
-    /// The current proof-of-work difficulty (leading zeros required).
-    /// Loaded from the DIFFICULTY constant on startup.
+    /// Current proof-of-work difficulty. Loaded from the DIFFICULTY constant.
     pub difficulty: usize,
 
-    /// Unconfirmed transactions waiting to be included in the next block.
-    /// Populated by add_transaction(). Drained by mine_block().
-    /// Saved to a separate .mempool file so pending transactions survive
-    /// program restarts (see chain_store.rs).
+    /// Signed transactions waiting to be included in the next block.
+    /// Populated by add_transaction(). Drained and cleared by mine_block().
+    /// Saved to a .mempool sidecar file so pending transactions survive restarts.
     pub mempool: Vec<Transaction>,
 
-    /// Maps each address to its current spendable coin balance.
-    /// Rebuilt by replaying all transactions whenever the chain loads from disk.
-    /// Keys are compact addresses (SHA-256 of public key, 64 hex chars).
+    /// Address → balance map (the simplified UTXO set).
+    /// Keys are compact 64-char addresses (SHA-256 of public key).
+    /// Rebuilt from scratch on every chain load — never trusted from disk.
     pub utxo_set: HashMap<String, u64>,
 
-    /// The total number of coins that currently exist across all wallets.
-    /// Starts at 0 and increases by the block reward each time a block is mined.
+    /// Total coins in existence. Increases by the block reward each mine.
     /// Never exceeds MAX_SUPPLY.
     pub total_supply: u64,
 }
 
 impl Blockchain {
-    /// Creates a fresh blockchain beginning from the hardcoded genesis block.
+    /// Creates a fresh blockchain starting from the hardcoded genesis block.
     ///
-    /// The genesis block is identical on every node — this shared starting
-    /// point allows nodes to validate each other's blocks and agree on
-    /// the canonical chain.
+    /// The genesis block is identical on every node. This shared starting
+    /// point is what allows nodes to validate each other's blocks and
+    /// agree on a canonical chain without any prior communication.
     pub fn new() -> Self {
         Blockchain {
             chain:        vec![Block::genesis()],
@@ -116,135 +113,114 @@ impl Blockchain {
 
     /// Returns a reference to the most recently confirmed block.
     ///
-    /// Used when building new blocks (to get prev_hash) and when validating
-    /// incoming blocks from peers (to check their prev_hash matches ours).
     /// Safe to unwrap — the chain always contains at least the genesis block.
     pub fn latest_block(&self) -> &Block {
         self.chain.last().unwrap()
     }
 
-    /// Returns the current spendable balance for a given address.
+    /// Returns the current spendable balance for an address.
     ///
-    /// Returns 0 for unknown addresses rather than an error, making balance
-    /// checks simpler at all call sites. An address with no received coins
-    /// is indistinguishable from an unknown address.
+    /// Returns 0 for unknown addresses rather than an error — an address
+    /// with no received coins is treated the same as an unknown address.
     pub fn get_balance(&self, address: &str) -> u64 {
         *self.utxo_set.get(address).unwrap_or(&0)
     }
 
     /// Calculates the block reward for the next block to be mined.
     ///
-    /// The reward halves every HALVING_INTERVAL blocks using bit-shifting:
+    /// Uses bit-shifting to implement halving efficiently:
     ///   INITIAL_REWARD >> halvings  =  divide by 2 for each halving
     ///
-    /// Example with INITIAL_REWARD=50, HALVING_INTERVAL=10:
     ///   Blocks  0- 9:  50 >> 0 = 50 coins
     ///   Blocks 10-19:  50 >> 1 = 25 coins
     ///   Blocks 20-29:  50 >> 2 = 12 coins
-    ///   Blocks 30-39:  50 >> 3 =  6 coins  ... and so on
+    ///   Blocks 30-39:  50 >> 3 =  6 coins  (and so on)
     ///
-    /// Also capped at the remaining supply so total_supply never exceeds
-    /// MAX_SUPPLY, even if the calculated reward would push it over.
+    /// Also capped at remaining supply so total_supply never exceeds MAX_SUPPLY.
     pub fn current_reward(&self) -> u64 {
         let halvings  = self.chain.len() as u64 / HALVING_INTERVAL;
         let reward    = INITIAL_REWARD >> halvings;
         let remaining = MAX_SUPPLY.saturating_sub(self.total_supply);
-        reward.min(remaining) // never give out more than what's left
+        reward.min(remaining)
     }
 
-    /// Returns true when all coins have been mined (total_supply >= MAX_SUPPLY).
-    ///
-    /// After this point, mine_block() still creates blocks to confirm
-    /// transactions, but issues no coinbase reward.
+    /// Returns true when the maximum supply has been reached.
     pub fn supply_exhausted(&self) -> bool {
         self.total_supply >= MAX_SUPPLY
     }
 
-    /// Applies a list of confirmed transactions to the UTXO set.
+    /// Updates UTXO balances by applying a confirmed list of transactions.
     ///
-    /// Called internally after a block is successfully mined or accepted from
-    /// a peer. For each transaction:
-    ///   - Coinbase: credit the recipient only (new coins enter circulation)
-    ///   - Regular:  deduct from sender AND credit recipient
+    /// For each transaction:
+    ///   Coinbase   →  credit recipient only (new coins enter circulation)
+    ///   Regular    →  deduct from sender AND credit recipient
     ///
-    /// Private — should only be called after full block validation so we never
-    /// apply transactions that haven't been properly confirmed.
+    /// Private — only called internally after a block has been fully validated,
+    /// never on individual unconfirmed transactions.
     fn apply_transactions(&mut self, transactions: &[Transaction]) {
         for tx in transactions {
             if tx.from != "coinbase" {
-                // Deduct from sender — balance check already passed in add_transaction()
                 let sender = self.utxo_set.entry(tx.sender_address()).or_insert(0);
                 *sender -= tx.amount;
             }
-            // Credit recipient — creates their entry in the map if it doesn't exist
             let recipient = self.utxo_set.entry(tx.to.clone()).or_insert(0);
             *recipient += tx.amount;
         }
     }
 
-    /// Validates and adds a transaction to the mempool (the pending queue).
+    /// Validates and adds a transaction to the mempool.
     ///
-    /// REJECTION REASONS:
-    ///   1. Invalid signature — the sender didn't authorize this transfer
-    ///   2. Insufficient confirmed balance — sender can't cover the amount
-    ///   3. Insufficient available balance — sender has enough confirmed coins
-    ///      but has already committed them in other pending mempool transactions
-    ///      (this prevents double-spending before a block is mined)
+    /// A transaction is rejected if:
+    ///   1. Its Dilithium3 signature is invalid
+    ///   2. The sender's confirmed balance is less than the amount
+    ///   3. The sender's balance minus other pending transactions is insufficient
+    ///      (prevents queuing multiple sends that together exceed the balance)
     ///
-    /// Accepted transactions wait in the mempool until mine_block() picks them
-    /// up, includes them in a block, and confirms them on the chain.
+    /// Accepted transactions wait until mine_block() picks them up.
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), String> {
-        // Check 1 — Dilithium3 signature must be valid for the sender's public key
         if !tx.is_valid() {
             return Err("Invalid transaction signature".to_string());
         }
 
-        // Check 2 — sender must have enough CONFIRMED coins
-        // sender_address() hashes tx.from (full public key) to get the address
-        // used as the key in utxo_set
         let sender_addr = tx.sender_address();
-        let balance = self.get_balance(&sender_addr);
+        let balance     = self.get_balance(&sender_addr);
+
         if balance < tx.amount {
             return Err(format!(
-                "Insufficient funds — {} has {} coins but tried to send {}",
+                "Insufficient funds — {} has {} coins, tried to send {}",
                 &sender_addr[..8], balance, tx.amount
             ));
         }
 
-        // Check 3 — account for coins already committed in other pending transactions
-        // Two sends from the same wallet could both pass check 2 individually
-        // but together exceed the balance. This prevents that.
-        let pending_spend: u64 = self.mempool
+        // Sum coins already committed in other pending transactions from this sender
+        let pending: u64 = self.mempool
             .iter()
-            .filter(|t| t.from == tx.from) // compare full public keys to identify same sender
+            .filter(|t| t.from == tx.from)
             .map(|t| t.amount)
             .sum();
 
-        if balance < tx.amount + pending_spend {
+        if balance < tx.amount + pending {
             return Err(format!(
-                "Insufficient funds — {} coins balance but {} already pending in mempool",
-                balance, pending_spend
+                "Insufficient funds — {} coins balance, {} already pending",
+                balance, pending
             ));
         }
 
-        // All checks passed — add to the waiting queue
         self.mempool.push(tx);
         Ok(())
     }
 
-    /// Mines a new block, awarding the miner's address the current block reward.
+    /// Mines a new block and awards the block reward to `miner_address`.
     ///
-    /// STEPS:
-    ///   1. Calculate the current reward (may be 0 if supply is exhausted)
+    /// Steps:
+    ///   1. Calculate the current reward (0 if supply exhausted)
     ///   2. Create a coinbase transaction crediting the miner
-    ///   3. Pull all pending transactions from the mempool into the block
-    ///   4. Build and mine the block (proof-of-work — the slow part)
-    ///   5. Update total_supply and all wallet balances
+    ///   3. Bundle coinbase + all mempool transactions into a new block
+    ///   4. Run proof-of-work mining (the slow part — tries nonces until valid)
+    ///   5. Update total_supply and all balances via apply_transactions()
     ///   6. Append the confirmed block to the chain
     ///
-    /// `miner_address` — the compact address (SHA-256 of public key) that
-    ///                   receives the block reward. Passed in from main.rs
-    ///                   as wallet.address().
+    /// `miner_address` — compact address (wallet.address()) that receives the reward
     pub fn mine_block(&mut self, miner_address: String) {
         if self.supply_exhausted() {
             println!("Max supply of {} coins reached — mining with no reward", MAX_SUPPLY);
@@ -252,39 +228,30 @@ impl Blockchain {
         }
 
         let reward = self.current_reward();
-
-        // Show the miner what they're working toward before the slow part starts
         println!("Block reward:    {} coins", reward);
         println!("Total supply:    {}/{}", self.total_supply, MAX_SUPPLY);
         println!("Difficulty:      {} leading zeros required", self.difficulty);
 
-        // Build the transaction list: coinbase reward first, then mempool transactions
+        // Build transaction list: coinbase reward first, then all pending transactions
         let mut transactions = vec![];
         if reward > 0 {
-            // The coinbase transaction creates new coins — "coinbase" as sender
-            // means no signature is required (validated by is_valid() in transaction.rs)
             transactions.push(Transaction::new(
                 "coinbase".to_string(),
                 miner_address,
                 reward,
             ));
         }
-        // drain(..) moves all mempool transactions into this block and empties the mempool
         transactions.extend(self.mempool.drain(..));
 
-        // Build the block structure (nonce=0, not yet valid)
+        // Build and mine the block
         let prev_hash = self.latest_block().hash.clone();
         let index     = self.chain.len() as u64;
         let mut block = Block::new(index, prev_hash, transactions.clone());
+        block.mine(self.difficulty); // ← expensive — may take seconds
 
-        // ← THE SLOW PART: try nonces until hash starts with `difficulty` zeros
-        block.mine(self.difficulty);
-
-        // Update supply counter and all wallet balances
+        // Update state and append to chain
         self.total_supply += reward;
         self.apply_transactions(&transactions);
-
-        // The block is now confirmed — add it to the permanent chain
         self.chain.push(block);
 
         println!("New total supply: {}/{}", self.total_supply, MAX_SUPPLY);
@@ -292,35 +259,20 @@ impl Blockchain {
 
     /// Validates the entire chain from genesis to the current tip.
     ///
-    /// For each block after genesis, verifies three things:
-    ///   1. HASH INTEGRITY   — the stored hash matches recalculating it now
-    ///                         (detects any modification to block contents)
-    ///   2. CHAIN LINKAGE    — prev_hash matches the actual previous block's hash
-    ///                         (detects insertions, deletions, or reordering)
-    ///   3. TRANSACTION SIGS — every non-coinbase transaction has a valid signature
-    ///                         (detects unauthorized coin transfers)
+    /// For each block after genesis, checks:
+    ///   1. Hash integrity   — stored hash matches recalculating it now
+    ///   2. Chain linkage    — prev_hash matches the actual previous block's hash
+    ///   3. Transaction sigs — every non-coinbase transaction is properly signed
     ///
-    /// Returns true if everything is consistent, false if any check fails.
-    /// Used by the `chain` command and could be used to reject a peer's chain.
+    /// Returns true if everything is consistent. Used by the `chain` command
+    /// and when deciding whether to adopt a chain received from a peer.
     pub fn is_valid(&self) -> bool {
         for i in 1..self.chain.len() {
             let current  = &self.chain[i];
             let previous = &self.chain[i - 1];
-
-            // Check 1: block contents unchanged since mining
-            if current.hash != current.calculate_hash() {
-                return false;
-            }
-
-            // Check 2: this block correctly references the one before it
-            if current.prev_hash != previous.hash {
-                return false;
-            }
-
-            // Check 3: every transaction in this block was properly authorized
-            if !current.transactions.iter().all(|tx| tx.is_valid()) {
-                return false;
-            }
+            if current.hash != current.calculate_hash()    { return false; }
+            if current.prev_hash != previous.hash          { return false; }
+            if !current.transactions.iter().all(|tx| tx.is_valid()) { return false; }
         }
         true
     }

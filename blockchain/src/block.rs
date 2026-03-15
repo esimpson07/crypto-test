@@ -1,38 +1,51 @@
 // =============================================================================
-// block.rs — Block Structure and Mining
+// block.rs — Block Structure and Proof-of-Work Mining
 // =============================================================================
 //
-// A block is a container that permanently records a group of transactions
-// on the blockchain. Once mined and accepted by the network, it cannot be
-// altered without redoing all the computational work for every subsequent block.
+// A block permanently records a group of transactions on the blockchain.
+// Once mined and accepted by the network, it cannot be altered without
+// redoing all the computational work for every block that follows it.
 //
-// WHAT MAKES BLOCKS TAMPER-EVIDENT (THE CHAINING MECHANISM):
+// THE CHAINING MECHANISM:
+//
 //   Each block stores the hash of the block before it in `prev_hash`.
-//   If you alter anything in an old block, its hash changes. That invalidates
-//   the next block's `prev_hash` reference, which changes THAT block's hash,
-//   which breaks the block after that... all the way to the tip. An attacker
-//   would need to redo the proof-of-work mining for every block from the
-//   tampered point forward — faster than the entire honest network. On any
-//   meaningful network this is computationally impossible.
+//   This creates a chain of cryptographic dependencies:
+//
+//     [Genesis] ← [Block 1] ← [Block 2] ← [Block 3] ← ...
+//
+//   If you alter anything in Block 1, its hash changes. That makes Block 2's
+//   `prev_hash` wrong, which changes Block 2's hash, which breaks Block 3,
+//   and so on. An attacker must redo all the mining from the tampered block
+//   forward, faster than the honest network produces new blocks — infeasible
+//   on any network with meaningful mining power.
+//
+// PROOF OF WORK:
+//
+//   Mining means finding a `nonce` value such that the block's SHA-256 hash
+//   starts with N leading zeros (N = difficulty). There is no shortcut —
+//   the miner tries nonces sequentially until one works. This costs real
+//   computation and electricity.
+//
+//   The asymmetry is what secures the chain:
+//     Finding a valid nonce  →  millions of hash computations (slow)
+//     Verifying a valid nonce →  one hash computation (instant)
+//
+//   Anyone can instantly verify a mined block is legitimate. Nobody can
+//   fake one without doing the actual work.
 //
 // BLOCK STRUCTURE:
-//   ┌────────────────────────────────────┐
+//
+//   ┌──────────────────────────────────────┐
 //   │  index       block number (0, 1, 2…) │
 //   │  timestamp   milliseconds since epoch │
-//   │  prev_hash   hash of previous block  │ ← the "chain" in blockchain
-//   │  hash        fingerprint of this block│
+//   │  prev_hash   hash of previous block   │ ← the chain link
+//   │  hash        SHA-256 of this block    │
 //   │  nonce       proof-of-work solution   │
-//   ├────────────────────────────────────┤
-//   │  transactions[]                      │
-//   │    [0] coinbase (mining reward)      │
-//   │    [1…] user transactions            │
-//   └────────────────────────────────────┘
-//
-// PROOF OF WORK (MINING):
-//   To add a block, the miner must find a `nonce` value such that the block's
-//   SHA-256 hash starts with N leading zeros (N = difficulty). There is no
-//   shortcut — the miner tries nonces sequentially until one works. This costs
-//   real electricity and time, making the chain expensive to forge.
+//   ├──────────────────────────────────────┤
+//   │  transactions[]                       │
+//   │    [0]  coinbase (mining reward)      │
+//   │    [1…] user transactions from pool   │
+//   └──────────────────────────────────────┘
 // =============================================================================
 
 use serde::{Serialize, Deserialize};
@@ -41,75 +54,70 @@ use crate::crypto;
 
 /// A single block in the blockchain.
 ///
-/// Serializable so blocks can be saved to disk (chain.json) and transmitted
-/// to peers over the P2P network as JSON.
+/// Serializable for saving to chain.json and sending to peers over the network.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Block {
-    /// Position of this block in the chain.
-    /// Genesis block is index 0, then 1, 2, 3... in order.
+    /// Position in the chain. Genesis = 0, then 1, 2, 3...
     pub index: u64,
 
-    /// Unix timestamp in milliseconds recording when this block was mined.
-    /// Used for display purposes and future difficulty adjustment.
+    /// Unix timestamp in milliseconds when this block was mined.
     pub timestamp: u64,
 
-    /// The hash of the immediately preceding block in the chain.
-    /// This field is what links blocks together — any change to a past block
-    /// changes its hash, which makes this field incorrect, which cascades
-    /// forward and invalidates every later block.
+    /// Hash of the previous block — the cryptographic chain link.
+    /// Any modification to a past block changes its hash, making this
+    /// field incorrect and invalidating every subsequent block.
     pub prev_hash: String,
 
-    /// This block's own SHA-256 hash — a fingerprint of all its contents.
-    /// Computed by calculate_hash() after mining. When other nodes receive
-    /// this block, they recompute the hash and reject it if it doesn't match.
+    /// SHA-256 hash of this block's contents.
+    /// Computed by calculate_hash() and verified by every peer that
+    /// receives this block. If the hash doesn't match, the block is rejected.
     pub hash: String,
 
-    /// The number that miners brute-force to satisfy the difficulty requirement.
-    /// Mining tries nonce = 0, 1, 2, 3... until calculate_hash() produces
-    /// a hash starting with the required number of leading zeros.
+    /// The number found by proof-of-work mining.
+    /// Incremented from 0 until calculate_hash() produces a hash that
+    /// starts with the required number of leading zeros.
     pub nonce: u64,
 
-    /// The list of transactions confirmed by this block.
-    /// Always starts with the coinbase transaction (the miner's reward),
-    /// followed by all user transactions that were waiting in the mempool.
+    /// Transactions confirmed by this block.
+    /// First entry is always the coinbase (mining reward).
+    /// Remaining entries are user transactions from the mempool.
     pub transactions: Vec<Transaction>,
 }
 
 impl Block {
-    /// Returns the hardcoded genesis block — the identical starting point
+    /// Returns the hardcoded genesis block — the shared starting point
     /// that every node on the network must begin from.
     ///
-    /// WHY HARDCODE IT?
-    ///   If each node generated its own genesis block using the current time,
-    ///   every genesis block would have a different timestamp and therefore
-    ///   a different hash. Nodes would immediately disagree on the chain's
-    ///   starting point and could never validate each other's blocks.
+    /// WHY HARDCODE IT:
+    ///   If each node generated a genesis block using the current time,
+    ///   every node would have a different genesis hash. They would
+    ///   immediately disagree on the chain and could never sync.
     ///
-    ///   By hardcoding a fixed timestamp, every node produces the exact same
-    ///   genesis hash. This shared starting point is what makes the network
-    ///   possible — it's the one fact every participant agrees on without
-    ///   needing to communicate first.
+    ///   A fixed timestamp means every node always computes the same
+    ///   genesis hash. This single shared fact makes the network possible.
+    ///
+    /// Never change the timestamp — doing so changes the genesis hash,
+    /// making your chain incompatible with every existing node.
     pub fn genesis() -> Self {
         let mut block = Block {
             index:        0,
-            timestamp:    1700000000000, // fixed forever — never change this
-            prev_hash:    "0".repeat(64), // no predecessor, so 64 zeros by convention
-            hash:         String::new(),  // computed below
+            timestamp:    1700000000000, // fixed — must never change
+            prev_hash:    "0".repeat(64),
+            hash:         String::new(),
             nonce:        0,
-            transactions: vec![],         // genesis carries no transactions
+            transactions: vec![],
         };
-        // Compute and store the hash — same result on every machine, every time
         block.hash = block.calculate_hash();
         block
     }
 
-    /// Creates a new block with the given transactions, ready to be mined.
+    /// Creates a new unmined block ready for proof-of-work.
     ///
-    /// After calling this, the block's hash won't yet meet the difficulty
-    /// target. Call mine() to find the nonce that makes it valid.
+    /// The initial hash won't meet the difficulty target. Call mine()
+    /// after this to find a valid nonce.
     ///
-    /// `index`        — this block's position (chain.len() at time of creation)
-    /// `prev_hash`    — the hash of the chain's current tip block
+    /// `index`        — this block's position (chain.len() at creation time)
+    /// `prev_hash`    — hash of the current chain tip
     /// `transactions` — coinbase first, then all mempool transactions
     pub fn new(index: u64, prev_hash: String, transactions: Vec<Transaction>) -> Self {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
@@ -121,19 +129,18 @@ impl Block {
             nonce: 0,
             transactions,
         };
-        // Initial hash — will change as nonce is incremented during mining
         block.hash = block.calculate_hash();
         block
     }
 
     /// Computes the SHA-256 hash of this block's contents.
     ///
-    /// All meaningful fields are included: index, timestamp, prev_hash, nonce,
-    /// and the merkle root (which represents all transactions). The `hash`
+    /// Includes all meaningful fields: index, timestamp, prev_hash, nonce,
+    /// and the Merkle root (which represents all transactions). The `hash`
     /// field itself is excluded since that's what we're computing.
     ///
-    /// This is called once per nonce attempt during mining (potentially
-    /// millions of times) and once by validating nodes to verify the block.
+    /// Called once per nonce attempt during mining (millions of times)
+    /// and once by validating nodes when they receive a block.
     pub fn calculate_hash(&self) -> String {
         let data = format!(
             "{}{}{}{}{}",
@@ -141,33 +148,26 @@ impl Block {
             self.timestamp,
             self.prev_hash,
             self.nonce,
-            self.merkle_root() // a single hash representing ALL transactions
+            self.merkle_root()
         );
         crypto::to_hex(&crypto::sha256(data.as_bytes()))
     }
 
-    /// Summarizes all transactions in this block into a single 32-byte hash
-    /// known as the Merkle root.
+    /// Summarizes all transactions in this block into a single 32-byte hash.
     ///
-    /// HOW IT WORKS:
-    ///   Each transaction is hashed individually. Then all those hashes are
-    ///   concatenated and hashed together into one final root hash.
-    ///   (A production blockchain uses a proper binary Merkle tree, but this
-    ///   simplified approach achieves the same tamper-evidence property.)
+    /// Each transaction is serialized to JSON and hashed individually.
+    /// All those hashes are then concatenated and hashed together into
+    /// one root hash. This is a simplified Merkle tree — a production
+    /// blockchain uses a proper binary tree but this achieves the same
+    /// tamper-evidence property: any change to any transaction changes
+    /// the root, which changes the block hash.
     ///
-    /// WHY IT MATTERS:
-    ///   - Any change to any transaction in the block changes the Merkle root
-    ///   - The Merkle root is included in calculate_hash(), so it affects the block hash
-    ///   - Therefore, altering any transaction invalidates the block entirely
-    ///   - The root is also used in light clients to prove a tx is in a block
-    ///     without downloading all transactions
+    /// Returns a placeholder hash of 32 zero bytes for empty blocks
+    /// (only the genesis block has no transactions).
     pub fn merkle_root(&self) -> String {
         if self.transactions.is_empty() {
-            // Empty block — use a placeholder hash of 32 zero bytes
             return crypto::to_hex(&[0u8; 32]);
         }
-
-        // Step 1: hash each transaction individually by serializing it to JSON
         let tx_hashes: Vec<String> = self.transactions
             .iter()
             .map(|tx| {
@@ -175,43 +175,32 @@ impl Block {
                 crypto::to_hex(&crypto::sha256(json.as_bytes()))
             })
             .collect();
-
-        // Step 2: combine all transaction hashes into one root hash
         let combined = tx_hashes.join("");
         crypto::to_hex(&crypto::sha256(combined.as_bytes()))
     }
 
-    /// Mines this block by trying nonces until the hash meets the difficulty target.
+    /// Mines this block by incrementing the nonce until the hash meets
+    /// the proof-of-work difficulty target.
     ///
-    /// The difficulty target requires the block hash to start with `difficulty`
-    /// leading zeros. For example, difficulty 5 means the hash must start with
-    /// "00000". Since we can't predict which nonce will produce a valid hash,
-    /// we try them sequentially: 0, 1, 2, 3...
+    /// The target requires the hash to start with `difficulty` leading zeros.
+    /// Each additional zero makes mining ~16x harder on average:
     ///
-    /// This is Proof of Work — it proves that real computational effort was
-    /// spent. Verifying the result takes one hash computation; finding it
-    /// takes millions. This asymmetry is what secures the blockchain.
+    ///   Difficulty 3  ≈ 4,096 attempts    (instant)
+    ///   Difficulty 5  ≈ 1,048,576 attempts (few seconds)
+    ///   Difficulty 7  ≈ 268 million attempts (minutes)
     ///
-    /// DIFFICULTY SCALE:
-    ///   Each additional leading zero makes mining ~16x harder on average.
-    ///   Difficulty 3 ≈ 4,096 attempts     (instant)
-    ///   Difficulty 5 ≈ 1,048,576 attempts (few seconds)
-    ///   Difficulty 7 ≈ 268 million attempts (minutes)
+    /// This function blocks until a valid nonce is found — on high difficulty
+    /// settings this may take many seconds. Mining on the real Bitcoin network
+    /// currently requires difficulty 23+.
     pub fn mine(&mut self, difficulty: usize) {
-        // Build the target string once — e.g. "00000" for difficulty 5
         let target = "0".repeat(difficulty);
         println!("Mining block {}...", self.index);
-
         loop {
             self.hash = self.calculate_hash();
-
             if self.hash.starts_with(&target) {
-                // A valid nonce was found — this block is now ready to broadcast
                 println!("Mined! Nonce: {}, Hash: {}", self.nonce, self.hash);
                 break;
             }
-
-            // This nonce didn't work — increment and try again
             self.nonce += 1;
         }
     }

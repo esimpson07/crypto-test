@@ -2,53 +2,64 @@
 // crypto.rs — Post-Quantum Cryptographic Primitives
 // =============================================================================
 //
-// This is the security foundation of the entire blockchain. Every operation
-// that requires trust — owning coins, authorizing transactions, linking blocks
-// together — ultimately depends on the functions in this file.
+// Every operation that requires trust in this blockchain — owning coins,
+// authorizing transactions, linking blocks together — depends on this file.
 //
 // WHAT THIS FILE PROVIDES:
-//   1. SHA-256 hashing    — produces a unique fixed-length fingerprint of any
-//                           data. Used for block hashing, mining (proof of work),
-//                           Merkle trees, and deriving wallet addresses.
 //
-//   2. Wallet key pairs   — every user has a private key (secret, never shared)
-//                           and a public key (freely shareable). The public key
-//                           is hashed to produce a compact wallet address.
+//   SHA-256 hashing
+//     Produces a unique 32-byte fingerprint of any data. Two critical
+//     properties make it useful here:
+//       Deterministic  — same input always produces the same output
+//       Avalanche      — changing one bit produces a completely different hash
+//     Used for block hashing, proof-of-work mining, Merkle trees, and
+//     deriving compact wallet addresses from public keys.
 //
-//   3. Signing            — proves you authorized a transaction without revealing
-//                           your private key. Only the holder of the private key
-//                           can produce a valid signature.
+//   Post-quantum key pairs (CRYSTALS-Dilithium3)
+//     Every wallet has a private key (secret, never shared) and a public
+//     key (freely shareable). The private key signs transactions; the public
+//     key lets anyone verify those signatures.
 //
-//   4. Verification       — lets anyone confirm a signature is genuine using only
-//                           the signer's public key. No trusted third party needed.
+//   Signing
+//     Proves you authorized a transaction without revealing your private key.
+//     Only the holder of the private key can produce a valid signature.
 //
-// WHY POST-QUANTUM (DILITHIUM3)?
-//   Classical ECDSA (secp256k1, used by Bitcoin) relies on the elliptic curve
-//   discrete logarithm problem. A quantum computer running Shor's Algorithm
-//   could solve this in polynomial time, meaning it could derive any private key
-//   from its public key — completely breaking wallet security.
+//   Verification
+//     Lets anyone confirm a signature is genuine using only the signer's
+//     public key. No trusted third party is needed.
 //
-//   CRYSTALS-Dilithium3 is based on the Module Learning With Errors (MLWE)
-//   lattice problem. No known quantum algorithm solves lattice problems
-//   significantly faster than classical computers, making Dilithium resistant
-//   to both current and future quantum attacks. It was standardized by NIST
-//   in 2024 as FIPS 204.
+// WHY DILITHIUM3 INSTEAD OF ECDSA?
 //
-// SIZE COST OF QUANTUM RESISTANCE:
+//   Bitcoin uses ECDSA on the secp256k1 elliptic curve. Security relies on
+//   the elliptic curve discrete logarithm problem (ECDLP). A quantum computer
+//   running Shor's Algorithm solves ECDLP in polynomial time — meaning it
+//   could derive any private key from its public key, breaking every wallet.
+//
+//   Dilithium3 is based on the Module Learning With Errors (MLWE) lattice
+//   problem. No known quantum algorithm solves lattice problems significantly
+//   faster than classical computers. It was standardized by NIST in 2024
+//   (FIPS 204) as the recommended post-quantum signature scheme.
+//
+// KEY SIZE COMPARISON:
+//
 //   ┌─────────────┬──────────────┬────────────────┐
 //   │             │ ECDSA        │ Dilithium3     │
 //   ├─────────────┼──────────────┼────────────────┤
 //   │ Public key  │ 33 bytes     │ 1,952 bytes    │
-//   │ Private key │ 32 bytes     │ 4,000 bytes    │
+//   │ Private key │ 32 bytes     │ 4,032 bytes    │
 //   │ Signature   │ 64 bytes     │ 3,293 bytes    │
 //   └─────────────┴──────────────┴────────────────┘
-//   Transactions and wallet files are larger as a result.
-//   This is the accepted tradeoff for quantum resistance today.
 //
-// NOTE ON SHA-256:
-//   SHA-256 (used for hashing/mining) is NOT replaced. Grover's Algorithm
-//   gives quantum computers only a quadratic speedup against hash functions,
-//   halving the effective security level to 128 bits — still secure.
+//   Larger keys and signatures are the accepted cost of quantum resistance.
+//   Transactions and wallet files are proportionally larger as a result.
+//
+// WHY SHA-256 IS NOT REPLACED:
+//
+//   SHA-256 (used for hashing and mining) is not vulnerable to Shor's
+//   Algorithm. Grover's Algorithm provides only a quadratic speedup against
+//   hash functions, effectively halving security from 256 to 128 bits.
+//   128-bit security is still computationally infeasible to attack and
+//   sufficient for all mining and hashing purposes here.
 // =============================================================================
 
 use sha2::{Sha256, Digest};
@@ -59,17 +70,12 @@ use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
 // Hashing
 // =============================================================================
 
-/// Hashes any slice of bytes using SHA-256, returning a fixed 32-byte array.
+/// Hashes any byte slice with SHA-256, returning a fixed 32-byte array.
 ///
-/// SHA-256 has two critical properties we rely on throughout the blockchain:
-///
-///   Deterministic:    the same input ALWAYS produces the same output.
-///                     sha256("hello") → 2cf24dba... every single time.
-///
-///   Avalanche effect: changing even one bit of input produces a COMPLETELY
-///                     different output. This is what makes blocks tamper-evident —
-///                     if you change one transaction, the block hash changes,
-///                     which breaks every subsequent block in the chain.
+/// The avalanche effect means even a one-bit change in input produces a
+/// completely different output — this is what makes blocks tamper-evident.
+/// If you alter any transaction in a block, the block hash changes, which
+/// breaks its link to the next block, cascading invalidation forward.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -78,58 +84,51 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Converts a byte slice into a lowercase hex string for display and storage.
 ///
-/// Raw bytes like [0x2c, 0xf2, 0x4d] are hard to read and can't be stored in
-/// JSON cleanly. This converts them to "2cf24d..." — printable, comparable,
-/// and JSON-safe. Used everywhere hashes and keys need to be shown or saved.
+/// Raw bytes are hard to read and don't serialize cleanly to JSON.
+/// Hex encoding turns [0x2c, 0xf2] into "2cf2..." — readable and JSON-safe.
+/// Used everywhere hashes, addresses, and keys need to be displayed or saved.
 pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
 // =============================================================================
-// Wallet
+// Wallet — Dilithium3 Key Pair
 // =============================================================================
 
 /// A wallet holding a Dilithium3 post-quantum key pair.
 ///
-/// HOW OWNERSHIP WORKS:
-///   Your private key is a secret random number. Anyone with your private key
-///   can spend your coins — it must never be shared or stored in plaintext.
+/// KEY OWNERSHIP MODEL:
+///   private_key  →  used to sign transactions (prove authorization)
+///   public_key   →  used to verify signatures (shared freely)
+///   address      →  SHA-256(public_key), compact 64-char hex (shared with others)
 ///
-///   Your public key is mathematically derived from the private key. It can
-///   be shared freely and is what others use to verify your signatures.
+///   The chain is one-way: you cannot reverse any step.
+///   Private key → public key → address, but never backwards.
 ///
-///   Your address is SHA-256(public_key) — a compact 64-char hex string that
-///   you give to others so they can send you coins.
-///
-///   The relationship is one-way: private key → public key → address.
-///   You cannot reverse any step. This is the mathematical guarantee of security.
-///
-/// STORAGE FORMAT:
-///   Both keys are stored as raw byte vectors (Vec<u8>) rather than
-///   library-specific types. This makes them easy to serialize, hex-encode,
-///   encrypt, and save to disk without depending on Dilithium internals.
-///   When loading from disk, we just decode the hex back to bytes.
+/// WHY BOTH KEYS ARE STORED:
+///   Unlike ECDSA, Dilithium3 does not support re-deriving the public key
+///   from the private key after generation (the crate does not expose this).
+///   Both keys are stored as raw byte vectors and saved together in the
+///   wallet file. On load, from_hex() splits them back apart using the
+///   crate's reported key size rather than a hardcoded constant.
 pub struct Wallet {
-    /// The Dilithium3 secret key — 4,000 bytes.
-    /// Used to produce signatures that prove you authorized a transaction.
-    /// Encrypted with AES-256-GCM and saved to a .dat file by wallet_store.rs.
-    /// The raw bytes are NEVER written to disk or transmitted over the network.
+    /// The Dilithium3 secret key (~4,032 bytes depending on crate version).
+    /// Used to produce signatures. Encrypted with AES-256-GCM before being
+    /// written to disk. Never transmitted over the network.
     pub private_key: Vec<u8>,
 
-    /// The Dilithium3 public key — 1,952 bytes.
-    /// Stored in every transaction you send (in the `from` field) so that
-    /// anyone receiving the transaction can verify your signature without
-    /// contacting any central authority.
-    /// Hashed via SHA-256 to produce your compact wallet address.
+    /// The Dilithium3 public key (1,952 bytes).
+    /// Included in every transaction in the `from` field so recipients can
+    /// verify the signature without contacting any central authority.
+    /// Hashed with SHA-256 to produce the compact wallet address.
     pub public_key: Vec<u8>,
 }
 
 impl Wallet {
-    /// Generates a brand new wallet with a randomly generated Dilithium3 key pair.
+    /// Generates a new wallet with a randomly generated Dilithium3 key pair.
     ///
-    /// Uses the operating system's cryptographically secure random number
-    /// generator (CSPRNG). The private key cannot be predicted or reproduced.
-    /// Every call produces a completely unique wallet.
+    /// Uses the OS cryptographically secure random number generator (CSPRNG).
+    /// Every call produces a completely unique, unpredictable key pair.
     pub fn new() -> Self {
         let (pk, sk) = dilithium3::keypair();
         Wallet {
@@ -139,24 +138,22 @@ impl Wallet {
     }
 
     /// Reconstructs a wallet from the combined private+public key hex string
-    /// that was saved to disk by wallet_store.rs.
+    /// saved to disk by wallet_store.rs.
     ///
-    /// WHY STORE BOTH KEYS?
-    ///   Unlike ECDSA, Dilithium does not allow re-deriving the public key
-    ///   from the private key after the fact (the crate doesn't expose this
-    ///   function). So we store both keys concatenated when saving:
-    ///     private key: 4,000 bytes = 8,000 hex chars  (positions 0..8000)
-    ///     public key:  1,952 bytes = 3,904 hex chars  (positions 8000..11904)
+    /// The wallet file stores both keys concatenated:
+    ///   [private key bytes][public key bytes]  →  hex encoded as one string
     ///
-    /// The combined hex string is what wallet_store.rs encrypts and saves.
-    /// This function splits them back apart when loading.
+    /// The split point is determined at runtime by querying the crate:
+    ///   dilithium3::secret_key_bytes() → the actual private key byte length
+    ///
+    /// We do NOT hardcode the split point because the private key size varies
+    /// between crate versions (e.g. 4,032 bytes in pqcrypto-dilithium v0.5).
+    /// Hardcoding caused a runtime panic when the assumed size was wrong.
     pub fn from_hex(combined_hex: &str) -> Self {
-        // Ask the crate for the actual secret key size in bytes, then convert to hex chars
-        // We can't hardcode this — the actual size varies by crate version
-        let sk_size_bytes = dilithium3::secret_key_bytes();
-        let sk_hex_len    = sk_size_bytes * 2; // each byte = 2 hex chars
+        // Ask the crate how large the secret key actually is in this version
+        let sk_byte_len = dilithium3::secret_key_bytes();
+        let sk_hex_len  = sk_byte_len * 2; // 2 hex chars per byte
 
-        // Split the combined hex string at the correct boundary
         let sk_hex = &combined_hex[..sk_hex_len];
         let pk_hex = &combined_hex[sk_hex_len..];
 
@@ -170,34 +167,32 @@ impl Wallet {
     ///
     /// Address = SHA-256(public_key_bytes)
     ///
-    /// WHY HASH THE PUBLIC KEY?
-    ///   1. Compactness: the raw public key is 1,952 bytes. The hash is 32 bytes.
-    ///      Addresses are what you share with others — shorter is better.
+    /// Hashing the public key serves two purposes:
+    ///   1. Compactness — 1,952 raw bytes becomes 32 bytes (64 hex chars)
+    ///   2. Extra quantum protection — even if lattice cryptography were
+    ///      broken in the future, an attacker would still need to reverse
+    ///      a SHA-256 hash to learn the public key from the address alone
     ///
-    ///   2. Extra quantum protection: even if lattice cryptography were broken
-    ///      in the future, an attacker would also need to reverse a SHA-256 hash
-    ///      to determine your public key from your address. Two layers of security.
-    ///
-    /// This is the address you share with others to receive coins.
-    /// The blockchain's UTXO set maps addresses → balances.
+    /// This address is what you share with others to receive coins.
+    /// The blockchain UTXO set uses addresses as keys to track balances.
     pub fn address(&self) -> String {
         to_hex(&sha256(&self.public_key))
     }
 
-    /// Signs arbitrary data with this wallet's Dilithium3 private key.
+    /// Signs arbitrary data using this wallet's Dilithium3 private key.
     ///
-    /// Returns a "detached signature" — the signature bytes are separate from
-    /// the message (as opposed to Dilithium's combined signed-message format).
-    /// Detached signatures are what we store in Transaction.signature.
+    /// Returns a detached signature — the signature bytes are separate from
+    /// the message, which is what Transaction.signature stores. "Detached"
+    /// contrasts with Dilithium's combined signed-message format where the
+    /// signature and message are concatenated.
     ///
-    /// The signature mathematically binds:
-    ///   - This specific data (what was signed)
-    ///   - This specific private key (who signed it)
+    /// The signature mathematically binds two things:
+    ///   - The specific data that was signed
+    ///   - The specific private key that signed it
     ///
-    /// Anyone can verify the signature is genuine using only the public key —
-    /// the private key is never needed for verification.
+    /// Anyone can verify authenticity using only the public key.
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
-        let sk = dilithium3::SecretKey::from_bytes(&self.private_key)
+        let sk  = dilithium3::SecretKey::from_bytes(&self.private_key)
             .expect("Invalid private key bytes");
         let sig = dilithium3::detached_sign(data, &sk);
         sig.as_bytes().to_vec()
@@ -208,38 +203,27 @@ impl Wallet {
 // Signature Verification
 // =============================================================================
 
-/// Verifies that a Dilithium3 detached signature was produced by the owner
-/// of the given public key over the given data.
+/// Verifies a Dilithium3 detached signature against a public key and message.
 ///
-/// Called by Transaction::is_valid() to confirm that whoever sent a transaction
-/// actually holds the private key corresponding to the `from` public key.
+/// Called by Transaction::is_valid() to confirm the sender actually holds
+/// the private key corresponding to the public key stored in Transaction.from.
+/// This is the mathematical guarantee that prevents transaction forgery.
 ///
-/// This is what makes it impossible to forge transactions — only the holder
-/// of the correct private key can produce a signature that passes this check.
+/// Returns false cleanly on any error (malformed key, malformed signature,
+/// or signature mismatch) rather than panicking — invalid data from peers
+/// is expected and should be handled gracefully.
 ///
-/// Takes raw byte slices so callers don't need to import Dilithium types.
-/// Returns false cleanly on any error rather than panicking.
-///
-/// `public_key_bytes` — the signer's raw public key bytes (from tx.from)
-/// `data`             — the exact bytes that were originally signed
+/// `public_key_bytes` — raw public key bytes from the transaction's `from` field
+/// `data`             — the exact bytes that were signed (signing_data())
 /// `sig_bytes`        — the detached signature bytes to verify
-pub fn verify_signature(
-    public_key_bytes: &[u8],
-    data: &[u8],
-    sig_bytes: &[u8],
-) -> bool {
-    // Attempt to reconstruct the public key from raw bytes — fail gracefully
+pub fn verify_signature(public_key_bytes: &[u8], data: &[u8], sig_bytes: &[u8]) -> bool {
     let pk = match dilithium3::PublicKey::from_bytes(public_key_bytes) {
         Ok(pk)  => pk,
-        Err(_)  => return false, // malformed public key
+        Err(_)  => return false,
     };
-
-    // Attempt to reconstruct the detached signature from raw bytes
     let sig = match dilithium3::DetachedSignature::from_bytes(sig_bytes) {
         Ok(sig) => sig,
-        Err(_)  => return false, // malformed signature
+        Err(_)  => return false,
     };
-
-    // Verify: returns Ok if the signature is valid, Err if it doesn't match
     dilithium3::verify_detached_signature(&sig, data, &pk).is_ok()
 }
