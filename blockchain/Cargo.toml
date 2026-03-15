@@ -1,0 +1,18 @@
+[package]
+name = "my_blockchain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"
+aes-gcm = "0.10"          # encryption for your wallet file
+pbkdf2 = "0.12"           # turns your password into an encryption key
+rand = "0.8"              # random number generation
+rpassword = "7.0"         # lets you type a password without it showing on screen
+tokio = { version = "1", features = ["full"] }   # async runtime
