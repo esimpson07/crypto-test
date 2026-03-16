@@ -13,24 +13,42 @@
 //
 //   1. Created    new() builds an unsigned transaction shell
 //   2. Signed     sign() attaches the Dilithium3 proof of authorization
-//   3. Validated  add_transaction() checks signature + balance + mempool
+//   3. Validated  add_transaction() checks signature + nonce + balance + mempool
 //   4. Confirmed  a miner includes it in a block — permanently on chain
 //
 // THE `from` FIELD — WHY IT'S A FULL PUBLIC KEY:
 //
-//   In classical ECDSA blockchains (like Bitcoin), `from` can store just
-//   the sender's short address because ECDSA supports public key recovery —
-//   you can mathematically reconstruct the public key from the signature.
+//   In classical ECDSA blockchains (like Bitcoin), `from` can store just the
+//   sender's short address because ECDSA supports public key recovery — you can
+//   mathematically reconstruct the public key from the signature alone.
 //
-//   Dilithium3 does NOT support public key recovery. The verifier needs
-//   the actual public key bytes to check the signature. So `from` must
-//   store the full 1,952-byte public key (3,904 hex chars).
+//   Dilithium3 does NOT support public key recovery. The verifier needs the
+//   actual public key bytes to check the signature. So `from` must store the
+//   full 1,952-byte public key (3,904 hex chars).
 //
 //   Consequences:
 //     - Transactions are larger (expected cost of quantum resistance)
 //     - sender_address() hashes `from` to get the compact address
 //     - Balance lookups use tx.sender_address(), never tx.from directly
 //     - The `to` field still uses the compact address (64 chars)
+//
+// THE `nonce` FIELD — REPLAY ATTACK PREVENTION:
+//
+//   Without a nonce, a signed transaction is valid forever. If Alice sends
+//   Bob 10 coins, anyone who saw that transaction on the blockchain could
+//   copy it and rebroadcast it later — making Alice send another 10 coins
+//   without her knowledge or consent. This is called a replay attack.
+//
+//   The nonce is a per-sender counter that must increment by exactly 1 with
+//   each transaction. The blockchain tracks the last confirmed nonce for every
+//   address in Blockchain.tx_nonces. A transaction whose nonce doesn't equal
+//   last_confirmed_nonce + 1 is rejected immediately.
+//
+//   This makes every transaction unique even if the same amount is sent to
+//   the same address repeatedly — the nonce will always differ.
+//
+//   Coinbase transactions use nonce = 0 (the field exists but is ignored
+//   during validation since coinbase transactions have no sender nonce to track).
 // =============================================================================
 
 use serde::{Serialize, Deserialize};
@@ -44,24 +62,35 @@ use crate::crypto;
 pub struct Transaction {
     /// The sender's full Dilithium3 public key as hex (3,904 chars).
     ///
-    /// This is NOT the sender's address — the address is SHA-256(from).
-    /// Call sender_address() to get the compact address for display or
-    /// balance lookups.
+    /// NOT the sender's address — the address is SHA-256(from).
+    /// Call sender_address() to get the compact address for display or lookups.
     ///
-    /// Special value "coinbase" marks a mining reward transaction. These
-    /// create new coins and require no signature or real sender.
+    /// Special value "coinbase" marks a mining reward transaction. These create
+    /// new coins and require no real sender, no nonce check, and no signature.
     pub from: String,
 
     /// The recipient's compact address as hex (64 chars).
     ///
-    /// This is SHA-256(recipient's public key) — what the recipient gets
-    /// from running `balance` and shares with anyone who wants to pay them.
+    /// SHA-256(recipient's public key) — what the recipient shares from `balance`.
     pub to: String,
 
-    /// Number of coins to transfer. Whole numbers only — no fractions.
+    /// Number of coins to transfer. Whole numbers only.
     pub amount: u64,
 
-    /// The Dilithium3 detached signature authorizing this transfer.
+    /// Per-sender sequence number for replay attack prevention.
+    ///
+    /// Must be exactly last_confirmed_nonce + 1 for this sender address.
+    /// The blockchain tracks confirmed nonces in Blockchain.tx_nonces.
+    ///
+    /// Why this works: once a transaction with nonce N is confirmed, any
+    /// future transaction using the same nonce N is rejected as out of sequence.
+    /// A replayed transaction always has the old nonce, which is now stale.
+    ///
+    /// Coinbase transactions set this to 0 — the field is present for
+    /// serialization consistency but is not validated for coinbase.
+    pub nonce: u64,
+
+    /// Dilithium3 detached signature authorizing this transfer.
     ///
     /// None until sign() is called. Any non-coinbase transaction without
     /// a signature fails is_valid() and is rejected by the blockchain.
@@ -79,42 +108,38 @@ impl Transaction {
     ///            or "coinbase" for mining reward transactions
     /// `to`     — recipient's compact address (from wallet.address())
     /// `amount` — whole number of coins to transfer
-    pub fn new(from: String, to: String, amount: u64) -> Self {
-        Transaction { from, to, amount, signature: None }
+    /// `nonce`  — must be exactly sender's last confirmed nonce + 1
+    ///            use blockchain.next_nonce(sender_address) to get the right value
+    ///            pass 0 for coinbase transactions
+    pub fn new(from: String, to: String, amount: u64, nonce: u64) -> Self {
+        Transaction { from, to, amount, nonce, signature: None }
     }
 
     /// Returns the bytes that are signed when authorizing this transaction.
     ///
-    /// Concatenates `from`, `to`, and `amount` as a UTF-8 byte string.
+    /// Concatenates from, to, amount, AND nonce as a UTF-8 byte string.
+    /// All four fields are included so that:
+    ///   - Changing the recipient invalidates the signature
+    ///   - Changing the amount invalidates the signature
+    ///   - Replaying with the same nonce is caught by the blockchain nonce check
+    ///   - Even if the nonce check were bypassed, a replay has an identical
+    ///     signature which nodes can detect and reject
+    ///
     /// The signature field is excluded — it doesn't exist when signing,
     /// and including it would be circular.
-    ///
-    /// Tamper-proofing: if any of the three fields change after signing,
-    /// the signing data changes and verification will fail. A transaction
-    /// cannot be modified after it has been authorized.
-    ///
-    /// Dilithium3 accepts arbitrary-length input (it hashes internally),
-    /// so we don't need to pre-hash the data the way ECDSA required.
     pub fn signing_data(&self) -> Vec<u8> {
-        format!("{}{}{}", self.from, self.to, self.amount).into_bytes()
+        format!("{}{}{}{}", self.from, self.to, self.amount, self.nonce).into_bytes()
     }
 
     /// Signs this transaction with the sender's Dilithium3 private key.
-    ///
-    /// Attaches a detached signature to the `signature` field. After calling
-    /// this, is_valid() will return true (assuming the correct wallet was used).
     pub fn sign(&mut self, wallet: &crypto::Wallet) {
         self.signature = Some(wallet.sign(&self.signing_data()));
     }
 
     /// Returns the sender's compact address for display and UTXO lookups.
     ///
-    /// Hashes `from` (the full public key) with SHA-256 to produce the
-    /// 64-char address — identical to wallet.address() for the same key.
-    ///
-    /// This is what the UTXO set uses as keys (address → balance), so all
-    /// balance checks must go through this method rather than using `from`
-    /// directly.
+    /// Hashes `from` (the full public key) with SHA-256 to produce the 64-char
+    /// address — identical to wallet.address() for the same key.
     ///
     /// Returns "coinbase" unchanged for mining reward transactions.
     pub fn sender_address(&self) -> String {
@@ -128,13 +153,14 @@ impl Transaction {
     /// Validates this transaction's signature.
     ///
     /// Rules:
-    ///   - "coinbase" transactions always pass — they create new coins and
-    ///     are generated by the protocol, not by a user with a private key
+    ///   - "coinbase" transactions always pass — created by the protocol,
+    ///     not by a user, so no signature or nonce check applies
     ///   - All other transactions must carry a valid Dilithium3 signature
     ///     produced by the private key corresponding to `from`
     ///
-    /// Note: this only checks the signature. Balance sufficiency is checked
-    /// separately in blockchain::add_transaction() when entering the mempool.
+    /// Note: nonce validation and balance checks are done separately in
+    /// blockchain::add_transaction() when the transaction enters the mempool.
+    /// This method only verifies the cryptographic signature.
     pub fn is_valid(&self) -> bool {
         if self.from == "coinbase" {
             return true;

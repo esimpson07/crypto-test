@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // Saves the blockchain to disk and loads it back so the chain, pending
-// transactions, and wallet balances survive program restarts.
+// transactions, and wallet state survive program restarts.
 //
 // WHAT GETS SAVED:
 //
@@ -13,14 +13,18 @@
 //
 // WHAT GETS REBUILT ON LOAD (NOT SAVED):
 //
-//   The UTXO set (address → balance) and total_supply are NOT written to disk.
-//   They are always reconstructed by replaying every transaction in the chain.
+//   Three derived fields are NOT written to disk and are always reconstructed
+//   by replaying every transaction in the chain from genesis:
+//
+//     utxo_set    — address → balance map
+//     tx_nonces   — address → last confirmed nonce (replay attack prevention)
+//     total_supply — total coins ever created
 //
 //   Why replay instead of saving directly?
-//     If the balance file were corrupted or manually edited, balances could
-//     diverge from the actual transaction history — someone could grant
-//     themselves coins without a valid signed block. Replaying the immutable
-//     chain guarantees balances always match what the transaction record says.
+//     If these files were corrupted or manually edited, state could diverge
+//     from the actual transaction history — someone could grant themselves
+//     coins or reset their nonce to enable replays. Replaying the immutable
+//     chain guarantees all derived state is always provably correct.
 //
 // THE MEMPOOL FILE:
 //
@@ -43,7 +47,7 @@ use crate::transaction::Transaction;
 ///   `path`          — confirmed blocks as pretty-printed JSON
 ///   `path`.mempool  — pending transactions as pretty-printed JSON
 ///
-/// UTXO set and total_supply are NOT saved — rebuilt from blocks on load.
+/// utxo_set, tx_nonces, and total_supply are NOT saved — rebuilt on load.
 pub fn save_chain(chain: &Blockchain, path: &str) -> Result<(), String> {
     let chain_json = serde_json::to_string_pretty(&chain.chain)
         .map_err(|e| e.to_string())?;
@@ -60,14 +64,15 @@ pub fn save_chain(chain: &Blockchain, path: &str) -> Result<(), String> {
 
 /// Loads the blockchain from disk, rebuilding all derived state from scratch.
 ///
-/// If no chain file exists, returns a fresh chain starting from genesis
-/// (handles first run automatically).
+/// If no chain file exists, returns a fresh chain from genesis (first run).
 ///
 /// Process:
 ///   1. Deserialize the block list from chain.json
-///   2. Replay every transaction in every block to rebuild the UTXO set
-///      and recount total_supply — guarantees correctness
-///   3. Load any pending mempool transactions, or start empty if none saved
+///   2. Replay every transaction in every block to rebuild:
+///        utxo_set    — address → balance
+///        tx_nonces   — address → last confirmed nonce
+///        total_supply — total coins ever minted
+///   3. Load pending mempool transactions (or start empty)
 pub fn load_chain(path: &str) -> Result<Blockchain, String> {
     if !Path::new(path).exists() {
         return Ok(Blockchain::new());
@@ -77,9 +82,10 @@ pub fn load_chain(path: &str) -> Result<Blockchain, String> {
     let blocks: Vec<Block> = serde_json::from_str(&chain_json)
         .map_err(|e| e.to_string())?;
 
-    // Replay all transactions to reconstruct UTXO set and supply count.
-    // Process blocks in chronological order, exactly as they were originally mined.
+    // Replay all transactions to reconstruct derived state.
+    // Process in chronological order, exactly as originally mined.
     let mut utxo_set:     HashMap<String, u64> = HashMap::new();
+    let mut tx_nonces:    HashMap<String, u64> = HashMap::new();
     let mut total_supply: u64 = 0;
 
     for block in &blocks {
@@ -89,17 +95,21 @@ pub fn load_chain(path: &str) -> Result<Blockchain, String> {
                 total_supply += tx.amount;
             } else {
                 // Regular transaction — deduct from sender
-                // sender_address() hashes the full public key to get the address key
                 let sender = utxo_set.entry(tx.sender_address()).or_insert(0);
                 *sender -= tx.amount;
+
+                // Record the confirmed nonce for this sender.
+                // next_nonce() returns this value + 1, which is what the next
+                // transaction from this address must use.
+                tx_nonces.insert(tx.sender_address(), tx.nonce);
             }
-            // Credit recipient (applies to both coinbase and regular transactions)
+            // Credit recipient for both coinbase and regular transactions
             let recipient = utxo_set.entry(tx.to.clone()).or_insert(0);
             *recipient += tx.amount;
         }
     }
 
-    // Load pending mempool transactions — or start with empty mempool if none saved
+    // Load pending mempool, or start empty if no mempool file exists
     let mempool_path = format!("{}.mempool", path);
     let mempool: Vec<Transaction> = if Path::new(&mempool_path).exists() {
         let mempool_json = fs::read_to_string(&mempool_path)
@@ -116,18 +126,18 @@ pub fn load_chain(path: &str) -> Result<Blockchain, String> {
 
     Ok(Blockchain {
         chain:        blocks,
-        difficulty:   DIFFICULTY, // always use the current constant
+        difficulty:   DIFFICULTY,
         mempool,
         utxo_set,
+        tx_nonces,
         total_supply,
     })
 }
 
-/// Deletes the mempool sidecar file after its transactions are confirmed on chain.
+/// Deletes the mempool sidecar file after its transactions are confirmed.
 ///
-/// Called after every successful mine or mine-and-broadcast. Once transactions
-/// are permanently recorded in a block, the pending mempool file is stale
-/// and should be cleaned up. Silently succeeds if the file doesn't exist.
+/// Called after every successful mine or mine-and-broadcast.
+/// Silently succeeds if the file doesn't exist.
 pub fn clear_mempool(path: &str) {
     let mempool_path = format!("{}.mempool", path);
     if Path::new(&mempool_path).exists() {
