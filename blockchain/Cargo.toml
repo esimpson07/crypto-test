@@ -1,18 +1,39 @@
 [package]
-name = "my_blockchain"
+name = "blockchain"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Post-quantum signatures — Dilithium3.
+# This crate is used instead of pqcrypto-dilithium because it exposes
+# Keypair::generate(Some(&seed)) for deterministic keypair generation,
+# which is required for 24-word phrase recovery to work.
+crystals-dilithium = "2.0.0"
+
+# BIP-39 mnemonic generation and validation (2048-word English wordlist).
+bip39 = "2"
+
+# SHA-2 family (SHA-256 for hashing, SHA-512 for PBKDF2).
 sha2 = "0.10"
+
+# PBKDF2 key derivation — used for both phrase→seed and wallet encryption.
+pbkdf2 = "0.12"
+
+# AES-256-GCM authenticated encryption for wallet files.
+aes-gcm = "0.10"
+
+# Cryptographically secure random number generation.
+rand = "0.8"
+
+# JSON serialization for blocks, transactions, and wallet files.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hex encoding for keys, hashes, and addresses.
 hex = "0.4"
+
+# Timestamps for block creation.
 chrono = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-pqcrypto-dilithium = "0.5"
-pqcrypto-traits = "0.3"
-aes-gcm = "0.10"          # encryption for your wallet file
-pbkdf2 = "0.12"           # turns your password into an encryption key
-rand = "0.8"              # random number generation
-rpassword = "7.0"         # lets you type a password without it showing on screen
-tokio = { version = "1", features = ["full"] }   # async runtime
+
+# Async runtime for P2P networking.
+tokio = { version = "1", features = ["full"] }
