@@ -7,7 +7,9 @@
 //
 // COMMANDS:
 //
-//   new-wallet              Generate a new post-quantum wallet, encrypted with a password
+//   new-wallet              Generate a new post-quantum wallet from a 24-word
+//                           phrase. The phrase alone can regenerate the wallet
+//                           on any machine — no backup file needed.
 //   list-wallets            Show all .dat wallet files in the current directory
 //   balance                 Show your address, balance, and current nonce
 //   mine                    Mine a block locally and earn the block reward
@@ -15,8 +17,7 @@
 //   send <to> <amount>      Sign a transaction and submit it to the mempool
 //   chain                   Print every block and its transactions
 //   node <port> [peer]      Start a persistent P2P node (runs until Ctrl+C)
-//   recover-wallet          Recover wallet from 12-word phrase + .phrase file
-//   show-phrase             Display your 12-word recovery phrase
+//   recover-wallet          Regenerate wallet from 24-word phrase alone
 //
 // GLOBAL OPTIONS (append to any command):
 //
@@ -24,12 +25,13 @@
 //   --network <n>    use chain file <n>_chain.json    (default: chain.json)
 //   --seed <ip:port> register with a seed node for peer discovery
 //
-// BLOCK PROPAGATION:
+// RECOVERY MODEL CHANGE FROM PREVIOUS VERSION:
 //
-//   The node command now maintains a shared PeerMap — a registry of all
-//   connected peers. When a block or transaction arrives from any peer,
-//   it is automatically forwarded to all other connected peers. This means
-//   broadcasting to ANY one peer propagates to the whole network.
+//   Old: 12-word phrase + .phrase backup file required
+//   New: 24-word phrase alone is sufficient — the keypair is mathematically
+//        derived from the phrase via PBKDF2 → Dilithium3 seed expansion.
+//        No .phrase file is created or needed. Losing the .dat file is fine
+//        as long as you have the 24 words.
 // =============================================================================
 
 #![allow(unused_imports, dead_code)]
@@ -56,7 +58,6 @@ use std::io::{self, Write};
 // =============================================================================
 
 /// Prints a prompt and reads one line from stdin.
-/// Input is visible as the user types. Trailing newline is trimmed.
 fn ask_password(prompt: &str) -> String {
     print!("{}", prompt);
     io::stdout().flush().unwrap();
@@ -66,7 +67,6 @@ fn ask_password(prompt: &str) -> String {
 }
 
 /// Finds "--wallet <n>" in args and returns "<n>.dat".
-/// Defaults to "wallet.dat" if the flag is absent.
 fn get_wallet_file(args: &[String]) -> String {
     for i in 0..args.len() {
         if args[i] == "--wallet" {
@@ -79,7 +79,6 @@ fn get_wallet_file(args: &[String]) -> String {
 }
 
 /// Finds "--network <n>" in args and returns "<n>_chain.json".
-/// Defaults to "chain.json" if the flag is absent.
 fn get_chain_file(args: &[String]) -> String {
     for i in 0..args.len() {
         if args[i] == "--network" {
@@ -104,7 +103,6 @@ fn public_key_hex(wallet: &crypto::Wallet) -> String {
 // Entry Point
 // =============================================================================
 
-/// Async main — #[tokio::main] is required for the networking layer.
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -116,8 +114,13 @@ async fn main() {
 
         // =====================================================================
         // new-wallet
-        // Generate a Dilithium3 key pair, show 12-word recovery phrase,
-        // encrypt with password, save to disk.
+        //
+        // Generates a 24-word BIP-39 phrase, derives the Dilithium3 keypair
+        // from it deterministically, then saves the encrypted keypair to disk.
+        //
+        // The phrase alone is sufficient to recover the wallet — no .phrase
+        // backup file is created. The .dat file is just a convenience cache
+        // so the user doesn't have to re-enter their phrase every time.
         // =====================================================================
         "new-wallet" => {
             if std::path::Path::new(wallet_file.as_str()).exists() {
@@ -133,42 +136,46 @@ async fn main() {
                 return;
             }
 
-            let wallet = crypto::Wallet::new();
+            // Generate a fresh 24-word BIP-39 phrase (256 bits of entropy).
+            let phrase = seed_phrase::generate_phrase();
+
+            // Derive the wallet deterministically from the phrase.
+            // This is the same call that recover-wallet will use — it always
+            // produces the same keypair from the same phrase.
+            let wallet = seed_phrase::wallet_from_phrase(&phrase);
             let combined_key_hex = format!(
                 "{}{}",
                 hex::encode(&wallet.private_key),
                 hex::encode(&wallet.public_key)
             );
 
-            let phrase = seed_phrase::generate_phrase();
-
             println!("\n╔══════════════════════════════════════════════════════════════╗");
-            println!("║           YOUR RECOVERY PHRASE — WRITE THIS DOWN            ║");
+            println!("║         YOUR 24-WORD RECOVERY PHRASE — WRITE THIS DOWN      ║");
             println!("╠══════════════════════════════════════════════════════════════╣");
             println!("{}", seed_phrase::format_for_display(&phrase));
             println!("╠══════════════════════════════════════════════════════════════╣");
-            println!("║  These 12 words can restore your wallet if you lose your    ║");
-            println!("║  password or wallet file. Write them on paper. Never store  ║");
-            println!("║  them digitally. Anyone with these words owns your coins.   ║");
+            println!("║  These 24 words ARE your wallet. They can regenerate your   ║");
+            println!("║  exact address and keys on any machine, with no backup file. ║");
+            println!("║  Write them on paper. Never store them digitally.            ║");
+            println!("║  Anyone with these words owns your coins.                    ║");
             println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-            let confirm_word = ask_password("Type word #4 to confirm you wrote them down: ");
-            let word_4 = phrase.split_whitespace().nth(3).unwrap_or("");
-            if confirm_word.trim() != word_4 {
-                println!("Wrong word — wallet not created. Try again and write them down first.");
+            // Ask the user to confirm word #7 to prove they wrote them down.
+            let confirm_word = ask_password("Type word #7 to confirm you wrote them down: ");
+            let word_7 = phrase.split_whitespace().nth(6).unwrap_or("");
+            if confirm_word.trim() != word_7 {
+                println!("Wrong word — wallet not created. Write down all 24 words first.");
                 return;
             }
 
+            // Save the encrypted keypair. The phrase is NOT stored anywhere —
+            // only the password-encrypted .dat file is written to disk.
             wallet_store::save_wallet(&combined_key_hex, &password, wallet_file.as_str())
                 .expect("Failed to save wallet");
 
-            let phrase_file = wallet_file.replace(".dat", ".phrase");
-            seed_phrase::save_phrase_backup(&combined_key_hex, &phrase, &phrase_file)
-                .expect("Failed to save phrase backup");
-
             println!("Wallet created: {}", wallet_file);
             println!("Your address:   {}", wallet.address());
-            println!("KEEP BOTH YOUR PASSWORD AND YOUR 12 WORDS SAFE");
+            println!("KEEP YOUR 24 WORDS SAFE — they are the only recovery method.");
         }
 
         // =====================================================================
@@ -182,7 +189,7 @@ async fn main() {
                 let name  = entry.file_name();
                 let name  = name.to_string_lossy();
                 if name.ends_with(".dat") {
-                    println!("  {}  →  use: --wallet {}", name, name.replace(".dat", ""));
+                    println!("  {}  ->  use: --wallet {}", name, name.replace(".dat", ""));
                 }
             }
         }
@@ -295,10 +302,10 @@ async fn main() {
                         format!("{}...", &from[..8])
                     };
                     if tx.from == "coinbase" {
-                        println!("  {} → {}... : {} coins",
+                        println!("  {} -> {}... : {} coins",
                             from_display, &tx.to[..8], tx.amount);
                     } else {
-                        println!("  {} → {}... : {} coins  [nonce: {}]",
+                        println!("  {} -> {}... : {} coins  [nonce: {}]",
                             from_display, &tx.to[..8], tx.amount, tx.nonce);
                     }
                 }
@@ -307,13 +314,6 @@ async fn main() {
 
         // =====================================================================
         // node <port> [direct_peer] [--seed <seed_ip:port>]
-        //
-        // Starts a persistent P2P node. Runs forever until Ctrl+C.
-        //
-        // A shared PeerMap is created here and passed to every peer handler
-        // (both direct connections and seed-discovered connections). This means
-        // all peers share the same propagation registry — a block arriving from
-        // any peer is forwarded to all others automatically.
         // =====================================================================
         "node" => {
             let port: u16 = args.get(2)
@@ -342,7 +342,6 @@ async fn main() {
                 .expect("Failed to load chain");
             let chain = Arc::new(Mutex::new(chain));
 
-            // Seed node peer discovery
             if let Some(ref seed) = seed_addr {
                 let our_ip   = network::get_public_ip().await;
                 let our_addr = format!("{}:{}", our_ip, port);
@@ -358,11 +357,6 @@ async fn main() {
                     network::heartbeat_loop(seed_clone, addr_clone).await;
                 });
 
-                // Create the shared peer map here so seed-discovered peers
-                // share the same map as peers connected via start_node.
-                // We pass it into handle_peer_public for each seed peer,
-                // and start_node creates its own internally — they share
-                // the same Arc so both sets of peers are in one registry.
                 let peers = network::new_peer_map();
 
                 for peer_addr in peer_list {
@@ -394,8 +388,6 @@ async fn main() {
 
         // =====================================================================
         // mine-and-broadcast <peer_ip:port>
-        //
-        // Syncs chain from peer first, then mines, then broadcasts.
         // =====================================================================
         "mine-and-broadcast" => {
             let peer = args.get(2)
@@ -408,7 +400,6 @@ async fn main() {
             let mut chain = chain_store::load_chain(chain_file.as_str())
                 .expect("Failed to load chain");
 
-            // ── SYNC FIRST ──────────────────────────────────────────────────
             println!("Syncing chain from {}...", peer);
             match TcpStream::connect(peer).await {
                 Ok(mut stream) => {
@@ -456,16 +447,12 @@ async fn main() {
                 }
             }
 
-            // ── MINE ────────────────────────────────────────────────────────
             println!("Mining on chain tip: block #{}", chain.latest_block().index);
             chain.mine_block(wallet.address());
             chain_store::save_chain(&chain, chain_file.as_str())
                 .expect("Failed to save chain");
             chain_store::clear_mempool(chain_file.as_str());
 
-            // ── BROADCAST ───────────────────────────────────────────────────
-            // The peer's node will receive the block and propagate it to all
-            // of its connected peers automatically via the PeerMap.
             let latest_block = chain.latest_block().clone();
             match TcpStream::connect(peer).await {
                 Ok(mut stream) => {
@@ -482,6 +469,9 @@ async fn main() {
 
         // =====================================================================
         // recover-wallet
+        //
+        // Regenerates the exact keypair from the 24-word phrase alone.
+        // No .phrase backup file is needed or consulted.
         // =====================================================================
         "recover-wallet" => {
             if std::path::Path::new(wallet_file.as_str()).exists() {
@@ -490,29 +480,21 @@ async fn main() {
                 return;
             }
 
-            println!("Enter your 12 recovery words separated by spaces:");
+            println!("Enter your 24 recovery words separated by spaces:");
             let phrase = ask_password("Recovery phrase: ");
 
+            // Validate the BIP-39 checksum before deriving anything.
+            // This catches most typos and wrong word orders immediately.
             if let Err(e) = seed_phrase::validate_phrase(&phrase) {
                 println!("Error: {}", e);
+                println!("Check spelling — all words must be from the BIP-39 English wordlist.");
                 return;
             }
 
-            let phrase_file = wallet_file.replace(".dat", ".phrase");
-            println!("Looking for phrase backup file: {}", phrase_file);
-            println!("(This file must be present — copy it from your backup)");
-
-            let (combined_key_hex, _stored_phrase) =
-                match seed_phrase::load_phrase_backup(&phrase, &phrase_file) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        println!("Recovery failed: {}", e);
-                        return;
-                    }
-                };
-
-            let wallet = crypto::Wallet::from_hex(&combined_key_hex);
-            println!("Recovered address: {}", wallet.address());
+            // Deterministically regenerate the keypair from the phrase.
+            // This is mathematically identical to what new-wallet did.
+            let wallet = seed_phrase::wallet_from_phrase(&phrase);
+            println!("\nRecovered address: {}", wallet.address());
             println!("Is this your address? (yes/no)");
             let confirm = ask_password("");
             if confirm.trim().to_lowercase() != "yes" {
@@ -527,6 +509,12 @@ async fn main() {
                 return;
             }
 
+            let combined_key_hex = format!(
+                "{}{}",
+                hex::encode(&wallet.private_key),
+                hex::encode(&wallet.public_key)
+            );
+
             wallet_store::save_wallet(&combined_key_hex, &new_password, wallet_file.as_str())
                 .expect("Failed to save recovered wallet");
 
@@ -535,44 +523,11 @@ async fn main() {
         }
 
         // =====================================================================
-        // show-phrase
-        // =====================================================================
-        "show-phrase" => {
-            let phrase_file = wallet_file.replace(".dat", ".phrase");
-            if !std::path::Path::new(&phrase_file).exists() {
-                println!("No phrase backup found for '{}'.", wallet_file);
-                println!("This wallet was created before phrase support was added.");
-                return;
-            }
-
-            println!("Your 12 recovery words will be shown. Make sure nobody can see your screen.");
-            let confirm = ask_password("Type 'show' to continue: ");
-            if confirm.trim() != "show" {
-                println!("Cancelled.");
-                return;
-            }
-
-            println!("Enter your 12 recovery words to decrypt the backup:");
-            let phrase = ask_password("Recovery phrase: ");
-
-            match seed_phrase::load_phrase_backup(&phrase, &phrase_file) {
-                Ok((_, stored_phrase)) => {
-                    println!("\n╔══════════════════════════════════════════════════════════════╗");
-                    println!("║                  YOUR RECOVERY PHRASE                       ║");
-                    println!("╠══════════════════════════════════════════════════════════════╣");
-                    println!("{}", seed_phrase::format_for_display(&stored_phrase));
-                    println!("╚══════════════════════════════════════════════════════════════╝\n");
-                }
-                Err(e) => println!("Failed to load phrase: {}", e),
-            }
-        }
-
-        // =====================================================================
         // help
         // =====================================================================
         _ => {
             println!("Commands:");
-            println!("  new-wallet                        create a new encrypted wallet");
+            println!("  new-wallet                        create a new wallet (24-word phrase)");
             println!("  list-wallets                      show all wallets on this machine");
             println!("  balance                           show address, balance, and nonce");
             println!("  mine                              mine a block and earn rewards");
@@ -580,24 +535,23 @@ async fn main() {
             println!("  send <to> <amount> [peer]         send coins to an address");
             println!("  chain                             print all blocks and transactions");
             println!("  node <port> [peer]                start a persistent P2P node");
-            println!("  recover-wallet                    recover wallet from 12-word phrase");
-            println!("  show-phrase                       display your recovery phrase");
+            println!("  recover-wallet                    regenerate wallet from 24-word phrase");
             println!();
             println!("Options (append to any command):");
             println!("  --wallet <n>      wallet file to use       (default: wallet.dat)");
             println!("  --network <n>     chain file to use        (default: chain.json)");
             println!("  --seed <ip:port>  seed node for discovery  (use with node command)");
             println!();
+            println!("Recovery:");
+            println!("  Your 24-word phrase IS your wallet — no backup file needed.");
+            println!("  cargo run -- recover-wallet --wallet alice");
+            println!();
             println!("Examples:");
             println!("  cargo run -- new-wallet --wallet alice");
             println!("  cargo run -- balance --wallet alice");
             println!("  cargo run -- mine --wallet alice --network mainnet");
             println!("  cargo run -- node 8001 --wallet alice --network mainnet");
-            println!("  cargo run -- node 8001 --seed 136.111.45.6:8000 --wallet alice");
-            println!("  cargo run -- node 8001 127.0.0.1:8000 --wallet alice");
-            println!("  cargo run -- mine-and-broadcast 127.0.0.1:8000 --wallet alice");
             println!("  cargo run -- send <address> 10 --wallet alice");
-            println!("  cargo run -- send <address> 10 127.0.0.1:8000 --wallet alice");
         }
     }
 }

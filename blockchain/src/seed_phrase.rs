@@ -1,171 +1,148 @@
 // =============================================================================
-// seed_phrase.rs — Seed Phrase Wallet Backup and Recovery
+// seed_phrase.rs — 24-Word Deterministic Wallet Recovery
 // =============================================================================
 //
-// HOW THIS WORKS:
+// HOW THIS WORKS (TRUE REGENERATION):
 //
-//   Unlike Bitcoin's BIP39 (where the phrase mathematically derives the keys),
-//   our approach uses the phrase as a human-readable password to encrypt a
-//   backup of the actual key bytes. This sidesteps the limitation that
-//   pqcrypto-dilithium v0.5 does not expose keypair_from_seed().
-//
-//   The security properties are equivalent:
-//     - 12 BIP39 words = 128 bits of entropy as the encryption password
-//     - The actual Dilithium3 keys are encrypted with AES-256-GCM
-//     - Losing both the .dat file AND the phrase = coins are gone
-//     - Having the phrase = can recover the keys on any machine
+//   Unlike the previous 12-word system (which encrypted a backup of the key
+//   bytes), this system DERIVES the keypair mathematically from the phrase.
+//   No .phrase backup file is needed — the phrase IS the wallet.
 //
 //   CREATION:
-//     1. Generate a real Dilithium3 keypair (cryptographically random)
-//     2. Generate 12 random BIP39 words (128 bits entropy)
-//     3. Save keypair encrypted with wallet password → wallet.dat
-//     4. Save keypair encrypted with phrase-derived key → wallet.phrase
-//     5. Show the 12 words to the user — they write them down
+//     1. Generate 32 random bytes (256 bits of entropy)
+//     2. Encode as a 24-word BIP-39 mnemonic (2048-word list, 11 bits/word,
+//        256 bits entropy + 8-bit SHA-256 checksum)
+//     3. Derive the Dilithium3 keypair from the phrase via PBKDF2
+//     4. Save the encrypted keypair to wallet.dat (for fast daily use)
+//     5. Show the 24 words — user writes them down
 //
-//   RECOVERY:
-//     1. User enters their 12 words
-//     2. We derive an AES key from the words using PBKDF2
-//     3. We decrypt wallet.phrase to get the keypair back
-//     4. User sets a new password → new wallet.dat is saved
+//   RECOVERY (no backup file required):
+//     1. User enters their 24 words
+//     2. BIP-39 checksum is validated — typos caught immediately
+//     3. PBKDF2-HMAC-SHA512 (2048 rounds) derives 64 bytes from the phrase
+//     4. First 32 bytes become the Dilithium3 seed
+//     5. Keypair::generate(Some(&seed)) deterministically regenerates
+//        the exact same public key, private key, and wallet address
+//     6. User sets a new password → new wallet.dat is saved
+//
+//   DERIVATION PATH:
+//     24-word BIP-39 phrase
+//       → PBKDF2-HMAC-SHA512 (2048 rounds, passphrase = "")
+//       → 64 bytes
+//       → first 32 bytes = Dilithium3 seed
+//       → Keypair::generate(Some(&seed))
+//       → (public_key, private_key, address)
+//
+// KEY PROPERTIES:
+//   - Same 24 words always produce the same address — recovery is exact
+//   - Different words produce a completely different, unrelated address
+//   - Word order matters — shuffling the words gives a different wallet
+//   - The BIP-39 checksum catches most typos before they derive a wrong key
+//   - The optional BIP-39 passphrase (hardcoded "" here) can be exposed
+//     as a CLI flag in the future for a two-factor recovery system
 // =============================================================================
 
 use bip39::{Mnemonic, Language};
-use sha2::Sha256;
 use pbkdf2::pbkdf2_hmac;
+use sha2::Sha512;
 use rand::RngCore;
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use aes_gcm::aead::{Aead, KeyInit};
+use crate::crypto::Wallet;
 
-/// Generates a new random 12-word BIP39 phrase.
-/// The phrase is used as a high-entropy password for encrypting the key backup.
+// =============================================================================
+// Core Derivation
+// =============================================================================
+
+/// Derives a Dilithium3 wallet deterministically from a 24-word BIP-39 phrase.
+///
+/// This is the central function of the regeneration system. Every other
+/// function in this file is either a helper to produce a phrase or a
+/// wrapper that calls this after validating the input.
+///
+/// Derivation path:
+///   phrase → PBKDF2-HMAC-SHA512(2048 rounds) → 64 bytes
+///           → first 32 bytes → Wallet::from_seed → Dilithium3 keypair
+///
+/// The BIP-39 standard defines the passphrase as an optional second factor.
+/// We use "" (empty) by default, which is the standard BIP-39 behaviour.
+/// All 64 PBKDF2 output bytes are equally strong; we take the first 32
+/// because Dilithium3 requires exactly 32 bytes of seed input.
+pub fn wallet_from_phrase(phrase: &str) -> Wallet {
+    // PBKDF2-HMAC-SHA512 with 2048 rounds — the standard BIP-39 KDF.
+    // This is far more brute-force-resistant than a bare hash.
+    // "mnemonic" prefix + passphrase is the BIP-39 standard salt format.
+    let salt = format!("mnemonic{}", ""); // passphrase = "" (standard BIP-39)
+    let mut seed_bytes = [0u8; 64];
+    pbkdf2_hmac::<Sha512>(
+        phrase.as_bytes(),
+        salt.as_bytes(),
+        2048,
+        &mut seed_bytes,
+    );
+
+    // Take the first 32 bytes as the Dilithium3 seed.
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes[..32]);
+
+    Wallet::from_seed(&seed)
+}
+
+// =============================================================================
+// Phrase Generation and Validation
+// =============================================================================
+
+/// Generates a new random 24-word BIP-39 mnemonic.
+///
+/// Uses 32 bytes (256 bits) of OS-provided cryptographically secure entropy.
+/// BIP-39 encodes this as 24 words: 11 bits/word × 24 = 264 bits total,
+/// where 256 bits are entropy and the remaining 8 bits are a SHA-256 checksum.
+///
+/// Returns the phrase as a space-separated string of 24 lowercase words,
+/// all from the standard 2048-word BIP-39 English wordlist.
 pub fn generate_phrase() -> String {
-    let mut entropy = [0u8; 16];
+    let mut entropy = [0u8; 32]; // 256 bits → 24 words
     rand::thread_rng().fill_bytes(&mut entropy);
-    Mnemonic::from_entropy(&entropy, Language::English)
-        .expect("Failed to create mnemonic")
-        .phrase()
+    Mnemonic::from_entropy_in(Language::English, &entropy)
+        .expect("Failed to create mnemonic from entropy")
         .to_string()
 }
 
-/// Validates that all words are valid BIP39 words in the correct format.
+/// Validates that a phrase is a valid BIP-39 mnemonic.
+///
+/// Checks two things:
+///   1. Every word is in the standard 2048-word English wordlist
+///   2. The embedded 8-bit SHA-256 checksum is correct
+///
+/// The checksum check catches most single-word typos and wrong word orders,
+/// providing immediate feedback before an incorrect key is derived.
 pub fn validate_phrase(phrase: &str) -> Result<(), String> {
-    Mnemonic::from_phrase(phrase, Language::English)
+    Mnemonic::parse_in(Language::English, phrase)
         .map(|_| ())
         .map_err(|e| format!("Invalid seed phrase: {}", e))
 }
 
-/// Derives a 32-byte AES encryption key from a seed phrase.
+// =============================================================================
+// Display
+// =============================================================================
+
+/// Formats a phrase for display with numbered words, 4 per line.
 ///
-/// Uses PBKDF2-HMAC-SHA256 with 100,000 iterations.
-/// The phrase has 128 bits of entropy so 100,000 iterations
-/// provides strong protection even though it's fast here —
-/// the attacker can't guess the phrase regardless of speed.
-fn phrase_to_aes_key(phrase: &str) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(
-        phrase.as_bytes(),
-        b"blockchain-phrase-backup-v1",
-        100_000,
-        &mut key,
-    );
-    key
-}
-
-/// Encrypts the combined key hex with the phrase as the encryption password.
-///
-/// Called during new-wallet to create the phrase-encrypted backup file.
-/// The phrase file can decrypt the keys without needing the wallet password.
-///
-/// `combined_key_hex` — private key hex + public key hex concatenated
-/// `phrase`           — the 12-word seed phrase (used as encryption key)
-/// `path`             — file path for the backup (e.g. "wallet_1.phrase")
-pub fn save_phrase_backup(
-    combined_key_hex: &str,
-    phrase: &str,
-    path: &str,
-) -> Result<(), String> {
-    use std::fs;
-    use serde::{Serialize, Deserialize};
-    use rand::RngCore;
-
-    #[derive(Serialize, Deserialize)]
-    struct PhraseFile {
-        phrase:     String,  // the 12 words (so user can see them again)
-        nonce:      String,  // AES-GCM nonce
-        ciphertext: String,  // encrypted key material
-    }
-
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-
-    let key_bytes = phrase_to_aes_key(phrase);
-    let key       = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher    = Aes256Gcm::new(key);
-    let nonce_obj = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce_obj, combined_key_hex.as_bytes())
-        .map_err(|e| format!("Encryption failed: {}", e))?;
-
-    let pf = PhraseFile {
-        phrase:     phrase.to_string(),
-        nonce:      hex::encode(nonce_bytes),
-        ciphertext: hex::encode(ciphertext),
-    };
-
-    let json = serde_json::to_string_pretty(&pf).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Loads the phrase file, shows the stored phrase, and decrypts the keys.
-///
-/// Called by recover-wallet and show-phrase commands.
-/// Returns (combined_key_hex, phrase_string).
-pub fn load_phrase_backup(phrase: &str, path: &str) -> Result<(String, String), String> {
-    use std::fs;
-    use serde::{Serialize, Deserialize};
-
-    #[derive(Serialize, Deserialize)]
-    struct PhraseFile {
-        phrase:     String,
-        nonce:      String,
-        ciphertext: String,
-    }
-
-    if !std::path::Path::new(path).exists() {
-        return Err(format!("Phrase backup file '{}' not found", path));
-    }
-
-    let json = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let pf: PhraseFile = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-
-    let nonce      = hex::decode(&pf.nonce).map_err(|e| e.to_string())?;
-    let ciphertext = hex::decode(&pf.ciphertext).map_err(|e| e.to_string())?;
-
-    let key_bytes = phrase_to_aes_key(phrase);
-    let key       = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher    = Aes256Gcm::new(key);
-    let nonce_obj = Nonce::from_slice(&nonce);
-
-    let plaintext = cipher
-        .decrypt(nonce_obj, ciphertext.as_ref())
-        .map_err(|_| "Wrong phrase — could not decrypt backup".to_string())?;
-
-    let combined_key_hex = String::from_utf8(plaintext).map_err(|e| e.to_string())?;
-    Ok((combined_key_hex, pf.phrase))
-}
-
-/// Formats the phrase for display with numbered words, 3 per line.
+/// Example output:
+///    1. abandon        2. ability        3. able           4. about
+///    5. above          6. absent         7. absorb         8. abstract
+///   ...
 pub fn format_for_display(phrase: &str) -> String {
     let words: Vec<&str> = phrase.split_whitespace().collect();
     let mut output = String::new();
     for (i, word) in words.iter().enumerate() {
         let num = i + 1;
         output.push_str(&format!("{:2}. {:<14}", num, word));
-        if num % 3 == 0 {
+        if num % 4 == 0 {
             output.push('\n');
         }
+    }
+    // Final newline if the last row was incomplete
+    if words.len() % 4 != 0 {
+        output.push('\n');
     }
     output
 }
